@@ -221,7 +221,6 @@ def process_gpx_to_chunked_days(folder_path):
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
     """Generates an optimized web map featuring interactive card containers and split-performance photos grouped by day."""
-    # --- UPDATE: COMPILATION OF UNIQUE DATE LIST ACROSS BOTH TRACKS AND IMAGES ---
     gpx_dates = set(daily_data.keys())
     photo_dates = {p["datetime"].date() for p in photo_data}
     master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
@@ -260,11 +259,9 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     colormap.add_to(mymap)
 
     print("🎨 Step 2: Generating vector overlays and injector stylesheets...")
-    # Loop over the master calendar grid timeline 
     for day_idx, date in enumerate(master_sorted_dates, 1):
         formatted_date = date.strftime('%b %d, %Y')
         
-        # Grab tracking properties if they exist for this calendar date
         day = daily_data.get(date, {
             'chunks': [], 'full_coords': [], 'max_speed': 0.0, 'distance_m': 0.0, 'total_seconds': 0.0
         })
@@ -288,10 +285,8 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             f"</span>"
         )
         
-        # Everything rendered inside this day_feature_group will show/hide together
         day_feature_group = folium.FeatureGroup(name=layer_title, overlay=True, control=True)
 
-        # Plot matching vehicle movement paths
         for points, avg_chunk_speed in day['chunks']:
             if avg_chunk_speed < 0:
                 color_hex = "#94a3b8"  
@@ -318,7 +313,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             """
             folium.PolyLine(locations=points, color=color_hex, weight=5, opacity=0.85, tooltip=folium.Tooltip(tooltip_html, sticky=True)).add_to(day_feature_group)
 
-        # --- UPDATE: BOUND MATCHING PHOTOS DIRECTLY TO THIS CHRONOLOGICAL DAY GROUP ---
         for global_idx, photo in enumerate(photo_data):
             if photo["datetime"].date() == date:
                 icon_html = f"""
@@ -418,6 +412,17 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             outline: none !important;
             box-shadow: none !important;
             -webkit-tap-highlight-color: transparent;
+        }
+
+        body.hide-photos-global .map-photo-marker {
+            display: none !important;
+            pointer-events: none !important;
+        }
+        
+        /* --- UI FIX: TARGET THE CANVAS OVERLAY ELEMENT EXCLUSIVELY --- */
+        body.hide-gpx-global .leaflet-overlay-pane canvas {
+            display: none !important;
+            pointer-events: none !important;
         }
 
         #global-photo-lightbox {
@@ -531,6 +536,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             var headerBlock = document.createElement('div');
             headerBlock.style.width = '100%';
             headerBlock.style.boxSizing = 'border-box';
+            
             headerBlock.innerHTML = `
                 <h4 style="margin:0 0 10px 0; color:#1e293b; font-size:15px; border-bottom: 2px solid #3b82f6; padding-bottom: 6px;">
                     🚀 <b>Journey Dashboard</b>
@@ -540,6 +546,14 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     <tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{format_duration(grand_total_seconds)}</td></tr>
                     <tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">{grand_total_distance_km:.1f} km</td></tr>
                 </table>
+                <div style="display: flex; gap: 16px; justify-content: flex-start; margin-top: 10px; padding-top: 10px; border-top: 1px solid #edf2f7; margin-bottom: 4px;">
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; font-weight: 600; color: #475569; user-select: none;">
+                        <input type="checkbox" id="global-filter-gpx" checked style="cursor: pointer; width: 14px; height: 14px;"> 🚗 Show Tracks
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; font-weight: 600; color: #475569; user-select: none;">
+                        <input type="checkbox" id="global-filter-photos" checked style="cursor: pointer; width: 14px; height: 14px;"> 📸 Show Photos
+                    </label>
+                </div>
             `;
             masterPanel.insertBefore(headerBlock, masterPanel.firstChild);
 
@@ -581,6 +595,22 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     masterPanel.classList.toggle('timeline-collapsed');
                 }});
                 
+                document.getElementById('global-filter-gpx').addEventListener('change', function(e) {{
+                    if (e.target.checked) {{
+                        document.body.classList.remove('hide-gpx-global');
+                    }} else {{
+                        document.body.classList.add('hide-gpx-global');
+                    }}
+                }});
+
+                document.getElementById('global-filter-photos').addEventListener('change', function(e) {{
+                    if (e.target.checked) {{
+                        document.body.classList.remove('hide-photos-global');
+                    }} else {{
+                        document.body.classList.add('hide-photos-global');
+                    }}
+                }});
+
                 document.getElementById('map-select-all').addEventListener('click', function(ev) {{
                     ev.stopPropagation();
                     var checkboxes = overlaysContainer.querySelectorAll('input[type="checkbox"]');
@@ -645,7 +675,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Synchronized timeline interface written to: '{output_html}'")
+    print(f"🎉 Success! High-performance rendering engine layer control fixed. Output written: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
