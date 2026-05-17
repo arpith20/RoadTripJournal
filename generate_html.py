@@ -222,7 +222,7 @@ def process_gpx_to_chunked_days(folder_path):
     return daily_data
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
-    """Generates an optimized web map featuring independent parallel async loading threads for dashboard safety."""
+    """Generates an optimized web map featuring dynamic cross-day multi-bound unique region pins."""
     gpx_dates = set(daily_data.keys())
     photo_dates = {p["datetime"].date() for p in photo_data}
     master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
@@ -240,7 +240,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         if day['max_speed'] > global_max_speed:
             global_max_speed = day['max_speed']
 
-    print("🛠️  Step 1.8: Pre-processing photos to isolate trip-wide spatial centroids...")
+    print("🛠️  Step 1.8: Pre-processing photos to calculate trip-wide structural region layouts...")
     photos_by_date = defaultdict(list)
     for p_idx, p_data in enumerate(photo_data):
         photos_by_date[p_data["datetime"].date()].append(p_idx)
@@ -250,6 +250,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     city_centroid_accumulator = defaultdict(list)
     radius_offset_degrees = 0.00012 
 
+    # Reverse-geocode and group photo matrices 
     for date, indices in photos_by_date.items():
         if not indices: continue
         
@@ -273,7 +274,12 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             resolved_city = processed_regional_keys[regional_key]
             if resolved_city:
                 city_centroid_accumulator[resolved_city].append((lat, lon))
+                # --- UPDATE: Bind city assignment token directly to photo matrix layer ---
+                photo_data[idx]['assigned_city'] = resolved_city
+            else:
+                photo_data[idx]['assigned_city'] = None
 
+        # Process micro visual de-stacking loop for map thumbnails
         spacial_stacks = defaultdict(list)
         for idx in indices:
             rounded_lat = round(photo_data[idx]['lat'], 5)
@@ -296,15 +302,27 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     photo_data[target_photo_idx]['lat'] = base_lat + offset_lat
                     photo_data[target_photo_idx]['lon'] = base_lon + offset_lon
 
+    # --- UPDATE: MAP ALL MATCHING TIMELINE DAY COUNTS FOR EACH UNIQUE REGION ---
     global_unique_city_pins = []
     for city_name, coord_list in city_centroid_accumulator.items():
         if not coord_list: continue
         avg_lat = sum(c[0] for c in coord_list) / len(coord_list)
         avg_lon = sum(c[1] for c in coord_list) / len(coord_list)
+        
+        # Scan trip directory to extract every unique day code this region was visited
+        matched_day_indices = set()
+        for photo in photo_data:
+            if photo.get('assigned_city') == city_name:
+                p_date = photo["datetime"].date()
+                if p_date in master_sorted_dates:
+                    day_idx = master_sorted_dates.index(p_date) + 1
+                    matched_day_indices.add(day_idx)
+                    
         global_unique_city_pins.append({
             "name": city_name,
             "lat": avg_lat,
-            "lon": avg_lon
+            "lon": avg_lon,
+            "days_list": ",".join(map(str, sorted(list(matched_day_indices))))
         })
         all_coords.append((avg_lat, avg_lon))
 
@@ -331,12 +349,9 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     print("🎨 Step 2: Generating vector overlays and injector stylesheets...")
     for day_idx, date in enumerate(master_sorted_dates, 1):
         formatted_date = date.strftime('%b %d, %Y')
-        
-        day = daily_data.get(date, {
-            'chunks': [], 'full_coords': [], 'max_speed': 0.0, 'distance_m': 0.0, 'total_seconds': 0.0
-        })
-        
+        day = daily_data.get(date, {'chunks': [], 'full_coords': [], 'max_speed': 0.0, 'distance_m': 0.0, 'total_seconds': 0.0})
         day_dist_km = day['distance_m'] / 1000.0
+        
         if day['total_seconds'] > 0:
             day_avg_speed = (day_dist_km / (day['total_seconds'] / 3600.0))
             avg_speed_str = f"{day_avg_speed:.1f} km/h"
@@ -397,11 +412,11 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
 
         day_feature_group.add_to(mymap)
 
-    # Isolated Global Pins Feature Group
-    pins_feature_group = folium.FeatureGroup(name="Global Region Pins Layer", overlay=True, control=False)
+    # --- UPDATE: PLOT PINS TO A SINGLE GLOBAL LAYER CAPABLE OF MULTI-LAYER READING INTERFACES ---
+    pins_feature_group = folium.FeatureGroup(name="Global Region Pins Storage Layer", overlay=True, control=False)
     for city_pin in global_unique_city_pins:
         city_html = f"""
-        <div class="city-marker-wrapper city-pin-marker">
+        <div class="city-marker-wrapper city-pin-marker" data-days="{city_pin['days_list']}">
             <span class="city-marker-dot"></span>
             <span class="city-marker-label">{city_pin["name"]}</span>
         </div>
@@ -459,7 +474,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         .leaflet-control-layers-base::before { content: "🎨" !important; font-size: 18px !important; display: block !important; line-height: 44px !important; text-align: center !important; width: 44px !important; height: 44px !important; flex-shrink: 0 !important; }
         .leaflet-control-layers-base label { display: none !important; }
         .leaflet-control-layers-base.active-click { width: 220px !important; height: auto !important; padding: 16px !important; align-items: stretch !important; justify-content: flex-start !important; cursor: default !important; }
-        .leaflet-control-layers-base.active-click::before { content: "🎨 Map Style" | font-weight: 700 !important; color: #1e293b !important; font-size: 13px !important; line-height: normal !important; text-align: left !important; width: auto !important; height: auto !important; margin-bottom: 12px !important; }
+        .leaflet-control-layers-base.active-click::before { content: "🎨 Map Style" !important; font-weight: 700 !important; color: #1e293b !important; font-size: 13px !important; line-height: normal !important; text-align: left !important; width: auto !important; height: auto !important; margin-bottom: 12px !important; }
         .leaflet-control-layers-base.active-click label { display: flex !important; width: auto !important; height: auto !important; margin-bottom: 6px !important; padding: 8px 12px !important; background: #f8fafc; border: 1px solid #e2e8f0 !important; animation: menuFadeIn 0.2s ease-out forwards !important; }
         .leaflet-control-zoom { position: fixed !important; bottom: 90px !important; right: 30px !important; top: auto !important; left: auto !important; margin: 0 !important; z-index: 9999 !important; background: rgba(255, 255, 255, 0.96) !important; backdrop-filter: blur(12px) webkit-backdrop-filter(12px); border: 1px solid rgba(226, 232, 240, 0.8) !important; border-radius: 12px !important; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important; overflow: hidden !important; display: flex !important; flex-direction: column !important; }
         .leaflet-control-zoom a { background: rgba(255, 255, 255, 0.96) !important; color: #475569 !important; border: none !important; border-bottom: 1px solid #edf2f7 !important; font-weight: 600 !important; transition: background 0.15s, color 0.15s !important; text-decoration: none !important; }
@@ -589,7 +604,40 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     }
 
-    // --- RE-ENGINEERED THREAD A: SAFE LEFT SYSTEM GRAPH OVERVIEW INITIALIZER ---
+    // --- UPDATE: CROSS-DAY TIMELINE EVALUATOR MATRIX ---
+    function updatePinVisibility() {
+        const labels = document.querySelectorAll('.leaflet-control-layers-overlays label');
+        const activeDays = new Set();
+        
+        labels.forEach(label => {
+            const checkbox = label.querySelector('input[type="checkbox"]');
+            if (checkbox && checkbox.checked) {
+                const titleSpan = label.querySelector('.timeline-day-title');
+                if (titleSpan) {
+                    const match = titleSpan.innerText.match(/Day\\s+(\\d+)/i);
+                    if (match) {
+                        activeDays.add(parseInt(match[1], 10));
+                    }
+                }
+            }
+        });
+
+        const pinElements = document.querySelectorAll('.city-pin-marker');
+        pinElements.forEach(pin => {
+            const daysAttr = pin.getAttribute('data-days');
+            if (!daysAttr) return;
+            
+            const pinDays = daysAttr.split(',').map(Number);
+            // Pin displays if AT LEAST one bound travel date checklist is checked
+            const isVisible = pinDays.some(d => activeDays.has(d));
+            
+            const markerWrapper = pin.closest('.leaflet-marker-icon');
+            if (markerWrapper) {
+                markerWrapper.style.setProperty('display', isVisible ? 'block' : 'none', 'important');
+            }
+        });
+    }
+
     function compileUnifiedLeftDashboard() {
         var masterPanel = document.querySelector('.leaflet-control-layers');
         if (masterPanel) {
@@ -693,6 +741,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                             cb.click();
                         }
                     });
+                    setTimeout(updatePinVisibility, 80);
                 });
                 
                 document.getElementById('map-deselect-all').addEventListener('click', function(ev) {
@@ -703,6 +752,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                             cb.click();
                         }
                     });
+                    setTimeout(updatePinVisibility, 80);
                 });
             }
         } else {
@@ -710,7 +760,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     }
 
-    // --- RE-ENGINEERED THREAD B: ISOLATED DROPDOWN MENU EVENT HOOK INJECTOR ---
     function setupRightStylePanel() {
         var stylePanel = document.querySelector('.leaflet-control-layers-base');
         if (stylePanel) {
@@ -732,14 +781,20 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     }
 
-    // Trigger independent setup tracks simultaneously
+    // Capture standard checklist mutations dynamically via bubble routing triggers
+    document.addEventListener('change', function(e) {
+        if (e.target && e.target.type === 'checkbox') {
+            setTimeout(updatePinVisibility, 50);
+        }
+    });
+
     compileUnifiedLeftDashboard();
     setupRightStylePanel();
+    setTimeout(updatePinVisibility, 200);
     </script>
     """
     
-    serialized_array = str([{k: v for k, v in p.items() if k != 'datetime'} for p in photo_data])
-    ui_javascript_injector = raw_js_template.replace("__PHOTO_DATA__", serialized_array)
+    ui_javascript_injector = raw_js_template.replace("__PHOTO_DATA__", str([{k: v for k, v in p.items() if k not in ('datetime', 'assigned_city')} for p in photo_data]))
     ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DAYS__", str(len(master_sorted_dates)))
     ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DURATION__", format_duration(grand_total_seconds))
     ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DISTANCE__", f"{grand_total_distance_km:.1f}")
@@ -767,7 +822,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Safe multi-threaded analytics view compiled cleanly to: '{output_html}'")
+    print(f"🎉 Success! Cross-day dynamic pin de-duplication resolved. Written to: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
