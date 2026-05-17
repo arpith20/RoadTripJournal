@@ -222,7 +222,7 @@ def process_gpx_to_chunked_days(folder_path):
     return daily_data
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
-    """Generates an interactive web map with unified regional centroid pins and localized image fan-outs."""
+    """Generates an optimized web map featuring independent parallel async loading threads for dashboard safety."""
     gpx_dates = set(daily_data.keys())
     photo_dates = {p["datetime"].date() for p in photo_data}
     master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
@@ -240,7 +240,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         if day['max_speed'] > global_max_speed:
             global_max_speed = day['max_speed']
 
-    print("🛠️  Step 1.8: Pre-processing photos to analyze structural region layouts...")
+    print("🛠️  Step 1.8: Pre-processing photos to isolate trip-wide spatial centroids...")
     photos_by_date = defaultdict(list)
     for p_idx, p_data in enumerate(photo_data):
         photos_by_date[p_data["datetime"].date()].append(p_idx)
@@ -248,13 +248,11 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     geolocator = Nominatim(user_agent="road_trip_journal_engine")
     processed_regional_keys = {}
     city_centroid_accumulator = defaultdict(list)
-    
     radius_offset_degrees = 0.00012 
 
     for date, indices in photos_by_date.items():
         if not indices: continue
         
-        # --- UPDATE PART A: COLLECT UNIQUE REGIONS BASED ON RAW TRUE UNROUNDED TELEMETRY ---
         for idx in indices:
             lat = photo_data[idx]['lat']
             lon = photo_data[idx]['lon']
@@ -262,7 +260,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             
             if regional_key not in processed_regional_keys:
                 try:
-                    time.sleep(0.5)  # Respect open OSM access policy bounds
+                    time.sleep(0.5) 
                     location_data = geolocator.reverse((lat, lon), timeout=4, language='en')
                     city_name = None
                     if location_data and 'address' in location_data.raw:
@@ -274,10 +272,8 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             
             resolved_city = processed_regional_keys[regional_key]
             if resolved_city:
-                # Accumulate the raw unshifted coordinates to find the true geometric center later
-                city_centroid_accumulator[(date, resolved_city)].append((lat, lon))
+                city_centroid_accumulator[resolved_city].append((lat, lon))
 
-        # Perform local stack alignment separation (micro fan-out loop)
         spacial_stacks = defaultdict(list)
         for idx in indices:
             rounded_lat = round(photo_data[idx]['lat'], 5)
@@ -300,13 +296,12 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     photo_data[target_photo_idx]['lat'] = base_lat + offset_lat
                     photo_data[target_photo_idx]['lon'] = base_lon + offset_lon
 
-    # --- UPDATE PART B: COMPUTE THE MATHEMATICAL CENTROID MATRIX ---
-    discovered_cities_by_date = defaultdict(list)
-    for (date, city_name), coord_list in city_centroid_accumulator.items():
+    global_unique_city_pins = []
+    for city_name, coord_list in city_centroid_accumulator.items():
         if not coord_list: continue
         avg_lat = sum(c[0] for c in coord_list) / len(coord_list)
         avg_lon = sum(c[1] for c in coord_list) / len(coord_list)
-        discovered_cities_by_date[date].append({
+        global_unique_city_pins.append({
             "name": city_name,
             "lat": avg_lat,
             "lon": avg_lon
@@ -400,19 +395,20 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                 """
                 folium.Marker(location=[photo["lat"], photo["lon"]], icon=custom_icon, tooltip=folium.Tooltip(tooltip_html, sticky=True)).add_to(day_feature_group)
 
-        # --- UPDATE PART C: INJECT SINGLE APPROXIMATE CENTROID PIN FOR METROPOLITAN CLUSTERS ---
-        if date in discovered_cities_by_date:
-            for city_pin in discovered_cities_by_date[date]:
-                city_html = f"""
-                <div class="city-marker-wrapper city-pin-marker">
-                    <span class="city-marker-dot"></span>
-                    <span class="city-marker-label">{city_pin["name"]}</span>
-                </div>
-                """
-                city_icon = folium.DivIcon(html=city_html, icon_size=(200, 30), icon_anchor=(10, 10))
-                folium.Marker(location=[city_pin["lat"], city_pin["lon"]], icon=city_icon).add_to(day_feature_group)
-
         day_feature_group.add_to(mymap)
+
+    # Isolated Global Pins Feature Group
+    pins_feature_group = folium.FeatureGroup(name="Global Region Pins Layer", overlay=True, control=False)
+    for city_pin in global_unique_city_pins:
+        city_html = f"""
+        <div class="city-marker-wrapper city-pin-marker">
+            <span class="city-marker-dot"></span>
+            <span class="city-marker-label">{city_pin["name"]}</span>
+        </div>
+        """
+        city_icon = folium.DivIcon(html=city_html, icon_size=(200, 30), icon_anchor=(10, 10))
+        folium.Marker(location=[city_pin["lat"], city_pin["lon"]], icon=city_icon).add_to(pins_feature_group)
+    pins_feature_group.add_to(mymap)
 
     folium.LayerControl(collapsed=False).add_to(mymap)
 
@@ -463,7 +459,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         .leaflet-control-layers-base::before { content: "🎨" !important; font-size: 18px !important; display: block !important; line-height: 44px !important; text-align: center !important; width: 44px !important; height: 44px !important; flex-shrink: 0 !important; }
         .leaflet-control-layers-base label { display: none !important; }
         .leaflet-control-layers-base.active-click { width: 220px !important; height: auto !important; padding: 16px !important; align-items: stretch !important; justify-content: flex-start !important; cursor: default !important; }
-        .leaflet-control-layers-base.active-click::before { content: "🎨 Map Style" !important; font-weight: 700 !important; color: #1e293b !important; font-size: 13px !important; line-height: normal !important; text-align: left !important; width: auto !important; height: auto !important; margin-bottom: 12px !important; }
+        .leaflet-control-layers-base.active-click::before { content: "🎨 Map Style" | font-weight: 700 !important; color: #1e293b !important; font-size: 13px !important; line-height: normal !important; text-align: left !important; width: auto !important; height: auto !important; margin-bottom: 12px !important; }
         .leaflet-control-layers-base.active-click label { display: flex !important; width: auto !important; height: auto !important; margin-bottom: 6px !important; padding: 8px 12px !important; background: #f8fafc; border: 1px solid #e2e8f0 !important; animation: menuFadeIn 0.2s ease-out forwards !important; }
         .leaflet-control-zoom { position: fixed !important; bottom: 90px !important; right: 30px !important; top: auto !important; left: auto !important; margin: 0 !important; z-index: 9999 !important; background: rgba(255, 255, 255, 0.96) !important; backdrop-filter: blur(12px) webkit-backdrop-filter(12px); border: 1px solid rgba(226, 232, 240, 0.8) !important; border-radius: 12px !important; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important; overflow: hidden !important; display: flex !important; flex-direction: column !important; }
         .leaflet-control-zoom a { background: rgba(255, 255, 255, 0.96) !important; color: #475569 !important; border: none !important; border-bottom: 1px solid #edf2f7 !important; font-weight: 600 !important; transition: background 0.15s, color 0.15s !important; text-decoration: none !important; }
@@ -593,12 +589,14 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     }
 
+    // --- RE-ENGINEERED THREAD A: SAFE LEFT SYSTEM GRAPH OVERVIEW INITIALIZER ---
     function compileUnifiedLeftDashboard() {
         var masterPanel = document.querySelector('.leaflet-control-layers');
-        var stylePanel = document.querySelector('.leaflet-control-layers-base');
-        
-        if (masterPanel && stylePanel) {
+        if (masterPanel) {
+            if (document.getElementById('journey-dashboard-header-block')) return;
+
             var headerBlock = document.createElement('div');
+            headerBlock.id = 'journey-dashboard-header-block';
             headerBlock.style.width = '100%';
             headerBlock.style.boxSizing = 'border-box';
             
@@ -707,7 +705,15 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     });
                 });
             }
+        } else {
+            setTimeout(compileUnifiedLeftDashboard, 100);
+        }
+    }
 
+    // --- RE-ENGINEERED THREAD B: ISOLATED DROPDOWN MENU EVENT HOOK INJECTOR ---
+    function setupRightStylePanel() {
+        var stylePanel = document.querySelector('.leaflet-control-layers-base');
+        if (stylePanel) {
             stylePanel.addEventListener('click', function(event) {
                 if (event.target.tagName === 'INPUT' || event.target.closest('label')) {
                     return;
@@ -722,10 +728,13 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                 }
             });
         } else {
-            setTimeout(compileUnifiedLeftDashboard, 100);
+            setTimeout(setupRightStylePanel, 100);
         }
     }
+
+    // Trigger independent setup tracks simultaneously
     compileUnifiedLeftDashboard();
+    setupRightStylePanel();
     </script>
     """
     
@@ -758,7 +767,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Beautiful spatial-centroid layout compiled smoothly to: '{output_html}'")
+    print(f"🎉 Success! Safe multi-threaded analytics view compiled cleanly to: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
