@@ -84,7 +84,6 @@ def process_images_folder(image_folder, thumb_folder):
     
     os.makedirs(thumb_folder, exist_ok=True)
     
-    # --- UPDATE: COMPLETELY PURGE ALL CONTENT IN THUMBNAILS FOR A FRESH REBUILD ---
     print("🧹 Step 1.2: Wiping thumbnail directory completely for a fresh rebuild...")
     for filename in os.listdir(thumb_folder):
         file_path = os.path.join(thumb_folder, filename)
@@ -103,7 +102,6 @@ def process_images_folder(image_folder, thumb_folder):
         
         meta = extract_image_metadata(file_path)
         if meta:
-            # --- UPDATE: REMOVED ONDEMAND SKIP CHECK TO ENFORCE SYSTEM REBUILDS ---
             try:
                 with Image.open(file_path) as img:
                     img = ImageOps.exif_transpose(img)
@@ -222,14 +220,18 @@ def process_gpx_to_chunked_days(folder_path):
     return daily_data
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
-    """Generates an optimized web map featuring interactive card containers and split-performance photos."""
-    sorted_dates = sorted(daily_data.keys()) if daily_data else []
+    """Generates an optimized web map featuring interactive card containers and split-performance photos grouped by day."""
+    # --- UPDATE: COMPILATION OF UNIQUE DATE LIST ACROSS BOTH TRACKS AND IMAGES ---
+    gpx_dates = set(daily_data.keys())
+    photo_dates = {p["datetime"].date() for p in photo_data}
+    master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
+
     all_coords = []
     global_max_speed = 0.0
     grand_total_distance_km = 0.0
     grand_total_seconds = 0.0
     
-    for date in sorted_dates:
+    for date in daily_data.keys():
         day = daily_data[date]
         all_coords.extend(day['full_coords'])
         grand_total_distance_km += (day['distance_m'] / 1000.0)
@@ -258,9 +260,15 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     colormap.add_to(mymap)
 
     print("🎨 Step 2: Generating vector overlays and injector stylesheets...")
-    for day_idx, date in enumerate(sorted_dates, 1):
-        day = daily_data[date]
+    # Loop over the master calendar grid timeline 
+    for day_idx, date in enumerate(master_sorted_dates, 1):
         formatted_date = date.strftime('%b %d, %Y')
+        
+        # Grab tracking properties if they exist for this calendar date
+        day = daily_data.get(date, {
+            'chunks': [], 'full_coords': [], 'max_speed': 0.0, 'distance_m': 0.0, 'total_seconds': 0.0
+        })
+        
         day_dist_km = day['distance_m'] / 1000.0
         
         if day['total_seconds'] > 0:
@@ -280,8 +288,10 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             f"</span>"
         )
         
+        # Everything rendered inside this day_feature_group will show/hide together
         day_feature_group = folium.FeatureGroup(name=layer_title, overlay=True, control=True)
 
+        # Plot matching vehicle movement paths
         for points, avg_chunk_speed in day['chunks']:
             if avg_chunk_speed < 0:
                 color_hex = "#94a3b8"  
@@ -308,26 +318,25 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             """
             folium.PolyLine(locations=points, color=color_hex, weight=5, opacity=0.85, tooltip=folium.Tooltip(tooltip_html, sticky=True)).add_to(day_feature_group)
 
-        day_feature_group.add_to(mymap)
+        # --- UPDATE: BOUND MATCHING PHOTOS DIRECTLY TO THIS CHRONOLOGICAL DAY GROUP ---
+        for global_idx, photo in enumerate(photo_data):
+            if photo["datetime"].date() == date:
+                icon_html = f"""
+                    <img src='{photo["thumb_url"]}' class='map-photo-marker' onclick='launchLightboxGallery({global_idx})' loading='lazy' />
+                """
+                custom_icon = folium.DivIcon(html=icon_html, icon_size=(44, 44), icon_anchor=(22, 22))
+                
+                tooltip_html = f"""
+                    <div style="font-family: 'Segoe UI', sans-serif; font-size: 12px; padding: 2px; color: #1e293b; white-space: nowrap;">
+                        <span style="font-weight: 500; color: #1e293b;">{photo["formatted_time"]}</span>
+                    </div>
+                """
+                folium.Marker(
+                    location=[photo["lat"], photo["lon"]], icon=custom_icon,
+                    tooltip=folium.Tooltip(tooltip_html, sticky=True)
+                ).add_to(day_feature_group)
 
-    if photo_data:
-        photo_feature_group = folium.FeatureGroup(name="📸 Travel Snapshots", overlay=True, control=True)
-        for idx, photo in enumerate(photo_data):
-            icon_html = f"""
-                <img src='{photo["thumb_url"]}' class='map-photo-marker' onclick='launchLightboxGallery({idx})' loading='lazy' />
-            """
-            custom_icon = folium.DivIcon(html=icon_html, icon_size=(44, 44), icon_anchor=(22, 22))
-            
-            tooltip_html = f"""
-                <div style="font-family: 'Segoe UI', sans-serif; font-size: 12px; padding: 2px; color: #1e293b; white-space: nowrap;">
-                    <span style="font-weight: 500; color: #1e293b;">{photo["formatted_time"]}</span>
-                </div>
-            """
-            folium.Marker(
-                location=[photo["lat"], photo["lon"]], icon=custom_icon,
-                tooltip=folium.Tooltip(tooltip_html, sticky=True)
-            ).add_to(photo_feature_group)
-        photo_feature_group.add_to(mymap)
+        day_feature_group.add_to(mymap)
 
     folium.LayerControl(collapsed=False).add_to(mymap)
 
@@ -527,7 +536,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     🚀 <b>Journey Dashboard</b>
                 </h4>
                 <table style="width:100%; border-collapse:collapse; line-height:1.7; font-size:13px; margin-bottom: 12px;">
-                    <tr><td style="color:#64748b;"><b>Total Timeline:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{len(sorted_dates)} Days</td></tr>
+                    <tr><td style="color:#64748b;"><b>Total Timeline:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{len(master_sorted_dates)} Days</td></tr>
                     <tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{format_duration(grand_total_seconds)}</td></tr>
                     <tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">{grand_total_distance_km:.1f} km</td></tr>
                 </table>
@@ -636,7 +645,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Web map tracking interface cleanly built at: '{output_html}'")
+    print(f"🎉 Success! Synchronized timeline interface written to: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
