@@ -1,13 +1,15 @@
 import os
 import math
 import time
+import json
 from datetime import datetime
 from collections import defaultdict
 import gpxpy
 import folium
 import branca.colormap as cm
 from PIL import Image, ImageOps
-from geopy.geocoders import Nominatim
+from geopy.geocoders import Nominatim  
+from tqdm import tqdm  
 
 def calculate_speed(p1, p2):
     """Calculates speed between two sequential points in km/h."""
@@ -48,7 +50,7 @@ def extract_image_metadata(image_path):
                 else:
                     return None
 
-            if not (lat_ref and lat_data and lon_ref and lon_data):
+            if not (lat_ref and lat_data and lon_ref and lon_data) or not dt_data:
                 return None
 
             def convert_to_degrees(value):
@@ -62,58 +64,55 @@ def extract_image_metadata(image_path):
             lon = convert_to_degrees(lon_data)
             if lon_ref in ['W', b'W']: lon = -lon
 
-            dt_obj = None
-            if dt_data:
-                if isinstance(dt_data, bytes):
-                    dt_data = dt_data.decode('utf-8')
-                try:
-                    dt_obj = datetime.strptime(dt_data.strip(), '%Y:%m:%d %H:%M:%S')
-                except ValueError:
-                    pass
-            
-            if not dt_obj:
-                dt_obj = datetime.fromtimestamp(os.path.getmtime(image_path))
+            if isinstance(dt_data, bytes):
+                dt_data = dt_data.decode('utf-8')
+            try:
+                dt_obj = datetime.strptime(dt_data.strip(), '%Y:%m:%d %H:%M:%S')
+            except ValueError:
+                return None
 
             return {"lat": lat, "lon": lon, "datetime": dt_obj}
     except Exception:
         return None
 
 def process_images_folder(image_folder, thumb_folder):
-    """Scans image folder, completely clears the thumbnail directory, and rebuilds all active thumbnails."""
+    """Scans image folder, safely syncs obsolete files, and skips generating existing thumbnails."""
     valid_photos = []
     if not os.path.exists(image_folder):
         return []
     
     os.makedirs(thumb_folder, exist_ok=True)
     
-    print("🧹 Wiping thumbnail directory completely for a fresh rebuild...")
+    active_source_images = [f for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    active_source_set = set(active_source_images)
+
+    print("Rules Dashboard: Syncing thumbnail directory to purge orphaned cache files...")
     for filename in os.listdir(thumb_folder):
-        file_path = os.path.join(thumb_folder, filename)
-        try:
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-        except Exception as e:
-            print(f"  Warning: Could not remove cached file {filename}: {e}")
+        if filename not in active_source_set:
+            file_path = os.path.join(thumb_folder, filename)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
 
-    active_source_images = {f for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))}
-
-    print("📷 Step 1.5: Analyzing telemetry data and rebuilding map thumbnails from scratch...")
-    for file_name in active_source_images:
+    print("📷 Step 1.5: Analyzing telemetry data and compiling missing map thumbnails...")
+    for file_name in tqdm(active_source_images, desc="📷 Processing & resizing trip photos", unit="photo"):
         file_path = os.path.join(image_folder, file_name)
         thumb_path = os.path.join(thumb_folder, file_name)
         
         meta = extract_image_metadata(file_path)
         if meta:
-            try:
-                with Image.open(file_path) as img:
-                    img = ImageOps.exif_transpose(img)
-                    if img.mode in ("RGBA", "P"):
-                        img = img.convert("RGB")
-                    img.thumbnail((120, 120))
-                    img.save(thumb_path, "JPEG", quality=85)
-            except Exception as e:
-                print(f"  Skipping thumbnail generation for {file_name}: {e}")
-                continue
+            if not os.path.exists(thumb_path):
+                try:
+                    with Image.open(file_path) as img:
+                        img = ImageOps.exif_transpose(img)
+                        if img.mode in ("RGBA", "P"):
+                            img = img.convert("RGB")
+                        img.thumbnail((120, 120))
+                        img.save(thumb_path, "JPEG", quality=85)
+                except Exception:
+                    continue
 
             valid_photos.append({
                 "filename": file_name,
@@ -124,6 +123,8 @@ def process_images_folder(image_folder, thumb_folder):
                 "datetime": meta["datetime"],
                 "formatted_time": meta["datetime"].strftime('%b %d, %Y • %I:%M %p')
             })
+        else:
+            tqdm.write(f"⚠️  Warning: Skipping '{file_name}' - missing EXIF GPS location or date/time info.")
             
     valid_photos.sort(key=lambda x: x["datetime"])
     return valid_photos
@@ -142,17 +143,14 @@ def process_gpx_to_chunked_days(folder_path):
         print(f"Error: Directory '{folder_path}' not found.")
         return {}
 
-    print(f"🚀 Step 1: Parsing GPX logs from target directory: {folder_path}...")
-    for file_name in os.listdir(folder_path):
-        if not file_name.lower().endswith('.gpx'):
-            continue
-            
+    gpx_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.gpx')]
+
+    for file_name in tqdm(gpx_files, desc="🚀 Parsing GPX navigation tracks", unit="track"):
         file_path = os.path.join(folder_path, file_name)
         with open(file_path, 'r', encoding='utf-8') as f:
             try:
                 gpx = gpxpy.parse(f)
-            except Exception as e:
-                print(f"Skipping corrupt file {file_name}: {e}")
+            except Exception:
                 continue
                 
         for track in gpx.tracks:
@@ -222,7 +220,7 @@ def process_gpx_to_chunked_days(folder_path):
     return daily_data
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
-    """Generates an optimized web map featuring dynamic cross-day multi-bound unique region pins."""
+    """Generates an optimized web map featuring online OpenStreetMap geocoding with a 2-decimal localized privacy cache."""
     gpx_dates = set(daily_data.keys())
     photo_dates = {p["datetime"].date() for p in photo_data}
     master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
@@ -240,46 +238,14 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         if day['max_speed'] > global_max_speed:
             global_max_speed = day['max_speed']
 
-    print("🛠️  Step 1.8: Pre-processing photos to calculate trip-wide structural region layouts...")
+    print("🛠️  Step 1.8: Pre-processing photos and fanning out stacked coordinates...")
     photos_by_date = defaultdict(list)
     for p_idx, p_data in enumerate(photo_data):
         photos_by_date[p_data["datetime"].date()].append(p_idx)
 
-    geolocator = Nominatim(user_agent="road_trip_journal_engine")
-    processed_regional_keys = {}
-    city_centroid_accumulator = defaultdict(list)
     radius_offset_degrees = 0.00012 
-
-    # Reverse-geocode and group photo matrices 
     for date, indices in photos_by_date.items():
         if not indices: continue
-        
-        for idx in indices:
-            lat = photo_data[idx]['lat']
-            lon = photo_data[idx]['lon']
-            regional_key = (round(lat, 2), round(lon, 2))
-            
-            if regional_key not in processed_regional_keys:
-                try:
-                    time.sleep(0.5) 
-                    location_data = geolocator.reverse((lat, lon), timeout=4, language='en')
-                    city_name = None
-                    if location_data and 'address' in location_data.raw:
-                        address = location_data.raw['address']
-                        city_name = address.get('city') or address.get('town') or address.get('village') or address.get('county') or address.get('state_district')
-                    processed_regional_keys[regional_key] = city_name
-                except Exception:
-                    processed_regional_keys[regional_key] = None
-            
-            resolved_city = processed_regional_keys[regional_key]
-            if resolved_city:
-                city_centroid_accumulator[resolved_city].append((lat, lon))
-                # --- UPDATE: Bind city assignment token directly to photo matrix layer ---
-                photo_data[idx]['assigned_city'] = resolved_city
-            else:
-                photo_data[idx]['assigned_city'] = None
-
-        # Process micro visual de-stacking loop for map thumbnails
         spacial_stacks = defaultdict(list)
         for idx in indices:
             rounded_lat = round(photo_data[idx]['lat'], 5)
@@ -302,14 +268,60 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     photo_data[target_photo_idx]['lat'] = base_lat + offset_lat
                     photo_data[target_photo_idx]['lon'] = base_lon + offset_lon
 
-    # --- UPDATE: MAP ALL MATCHING TIMELINE DAY COUNTS FOR EACH UNIQUE REGION ---
+    print("🌍 Step 1.9: Resolving regional names via OpenStreetMap online network API...")
+    city_centroid_accumulator = defaultdict(list)
+    geolocator = Nominatim(user_agent="road_trip_journal_engine_v3")
+    
+    cache_file_path = "geocache.json"
+    if os.path.exists(cache_file_path):
+        with open(cache_file_path, "r", encoding="utf-8") as f:
+            geo_cache = json.load(f)
+    else:
+        geo_cache = {}
+
+    cache_updated = False
+
+    for idx in tqdm(range(len(photo_data)), desc="🌍 Geocoding photo parameters", unit="photo"):
+        lat = photo_data[idx]['lat']
+        lon = photo_data[idx]['lon']
+        
+        # --- UPDATE: BROAD 2-DECIMAL PLACES WINDOW KEY FOR OBFUSCATED CLUSTERING ---
+        cache_key = f"{round(lat, 4)},{round(lon, 4)}"
+        
+        if cache_key in geo_cache:
+            city_name = geo_cache[cache_key]
+        else:
+            try:
+                time.sleep(1.0) 
+                location_data = geolocator.reverse((lat, lon), timeout=5, language='en')
+                city_name = None
+                if location_data and 'address' in location_data.raw:
+                    address = location_data.raw['address']
+                    city_name = address.get('city') or address.get('town') or address.get('village')
+                
+                if not city_name or city_name.strip() == "":
+                    city_name = "Unknown Area"
+                    
+                geo_cache[cache_key] = city_name
+                cache_updated = True
+            except Exception:
+                city_name = "Unknown Area"
+        
+        photo_data[idx]['assigned_city'] = city_name
+        if city_name and city_name != "Unknown Area":
+            city_centroid_accumulator[city_name].append((lat, lon))
+
+    if cache_updated:
+        with open(cache_file_path, "w", encoding="utf-8") as f:
+            json.dump(geo_cache, f, ensure_ascii=False, indent=4)
+
     global_unique_city_pins = []
     for city_name, coord_list in city_centroid_accumulator.items():
         if not coord_list: continue
+        # Centers the macro regional pin at the average mathematical centroid of the 1.1km grid scope
         avg_lat = sum(c[0] for c in coord_list) / len(coord_list)
         avg_lon = sum(c[1] for c in coord_list) / len(coord_list)
         
-        # Scan trip directory to extract every unique day code this region was visited
         matched_day_indices = set()
         for photo in photo_data:
             if photo.get('assigned_city') == city_name:
@@ -346,7 +358,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     )
     colormap.add_to(mymap)
 
-    print("🎨 Step 2: Generating vector overlays and injector stylesheets...")
+    print("🎨 Step 2: Injecting styles and compiling vector canvases...")
     for day_idx, date in enumerate(master_sorted_dates, 1):
         formatted_date = date.strftime('%b %d, %Y')
         day = daily_data.get(date, {'chunks': [], 'full_coords': [], 'max_speed': 0.0, 'distance_m': 0.0, 'total_seconds': 0.0})
@@ -412,7 +424,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
 
         day_feature_group.add_to(mymap)
 
-    # --- UPDATE: PLOT PINS TO A SINGLE GLOBAL LAYER CAPABLE OF MULTI-LAYER READING INTERFACES ---
+    # Global Isolated Structural Pin Layer (De-duplicated macro regional views)
     pins_feature_group = folium.FeatureGroup(name="Global Region Pins Storage Layer", overlay=True, control=False)
     for city_pin in global_unique_city_pins:
         city_html = f"""
@@ -604,7 +616,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     }
 
-    // --- UPDATE: CROSS-DAY TIMELINE EVALUATOR MATRIX ---
     function updatePinVisibility() {
         const labels = document.querySelectorAll('.leaflet-control-layers-overlays label');
         const activeDays = new Set();
@@ -628,7 +639,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             if (!daysAttr) return;
             
             const pinDays = daysAttr.split(',').map(Number);
-            // Pin displays if AT LEAST one bound travel date checklist is checked
             const isVisible = pinDays.some(d => activeDays.has(d));
             
             const markerWrapper = pin.closest('.leaflet-marker-icon');
@@ -781,7 +791,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     }
 
-    // Capture standard checklist mutations dynamically via bubble routing triggers
     document.addEventListener('change', function(e) {
         if (e.target && e.target.type === 'checkbox') {
             setTimeout(updatePinVisibility, 50);
@@ -822,7 +831,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Cross-day dynamic pin de-duplication resolved. Written to: '{output_html}'")
+    print(f"🎉 Success! Obfuscated city-name pin configuration saved to: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
