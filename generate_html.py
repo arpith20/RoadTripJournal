@@ -26,6 +26,10 @@ def format_duration(seconds):
     minutes = int((seconds % 3600) // 60)
     return f"{hours}h {minutes}m"
 
+def slugify_city(name):
+    """Generates a clean, lowercase alphanumeric structural ID to prevent escaping bugs."""
+    return "".join(c for c in str(name) if c.isalnum()).lower()
+
 def extract_image_metadata(image_path):
     """Extracts geographic coordinates and capture time from image EXIF headers."""
     try:
@@ -86,7 +90,7 @@ def process_images_folder(image_folder, thumb_folder):
     active_source_images = [f for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
     active_source_set = set(active_source_images)
 
-    print("Rules Dashboard: Syncing thumbnail directory to purge orphaned cache files...")
+    print("Purging orphaned thumbnail cache files...")
     for filename in os.listdir(thumb_folder):
         if filename not in active_source_set:
             file_path = os.path.join(thumb_folder, filename)
@@ -220,7 +224,7 @@ def process_gpx_to_chunked_days(folder_path):
     return daily_data
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
-    """Generates an optimized web map featuring online OpenStreetMap geocoding with a 2-decimal localized privacy cache."""
+    """Generates an optimized web map with dynamic route lines and transparent custom arrow icons."""
     gpx_dates = set(daily_data.keys())
     photo_dates = {p["datetime"].date() for p in photo_data}
     master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
@@ -268,9 +272,9 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     photo_data[target_photo_idx]['lat'] = base_lat + offset_lat
                     photo_data[target_photo_idx]['lon'] = base_lon + offset_lon
 
-    print("🌍 Step 1.9: Resolving regional names via OpenStreetMap online network API...")
+    print("🌍 Step 1.9: Resolving city names via OpenStreetMap online network API...")
     city_centroid_accumulator = defaultdict(list)
-    geolocator = Nominatim(user_agent="road_trip_journal_engine_v3")
+    geolocator = Nominatim(user_agent="road_trip_journal_engine_v7")
     
     cache_file_path = "geocache.json"
     if os.path.exists(cache_file_path):
@@ -284,8 +288,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     for idx in tqdm(range(len(photo_data)), desc="🌍 Geocoding photo parameters", unit="photo"):
         lat = photo_data[idx]['lat']
         lon = photo_data[idx]['lon']
-        
-        # --- UPDATE: BROAD 2-DECIMAL PLACES WINDOW KEY FOR OBFUSCATED CLUSTERING ---
         cache_key = f"{round(lat, 4)},{round(lon, 4)}"
         
         if cache_key in geo_cache:
@@ -318,7 +320,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     global_unique_city_pins = []
     for city_name, coord_list in city_centroid_accumulator.items():
         if not coord_list: continue
-        # Centers the macro regional pin at the average mathematical centroid of the 1.1km grid scope
         avg_lat = sum(c[0] for c in coord_list) / len(coord_list)
         avg_lon = sum(c[1] for c in coord_list) / len(coord_list)
         
@@ -332,6 +333,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     
         global_unique_city_pins.append({
             "name": city_name,
+            "id": slugify_city(city_name),
             "lat": avg_lat,
             "lon": avg_lon,
             "days_list": ",".join(map(str, sorted(list(matched_day_indices))))
@@ -340,6 +342,45 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
 
     for photo in photo_data:
         all_coords.append((photo["lat"], photo["lon"]))
+
+    city_centroids = {cp["name"]: (cp["lat"], cp["lon"]) for cp in global_unique_city_pins}
+    chronological_hops = []
+    last_hop_city = None
+
+    for photo in photo_data:
+        c_name = photo.get('assigned_city')
+        if c_name and c_name != "Unknown Area" and c_name in city_centroids:
+            if c_name != last_hop_city:
+                chronological_hops.append({
+                    "city": c_name,
+                    "city_id": slugify_city(c_name),
+                    "formatted_time": photo["formatted_time"],
+                    "timestamp_date": photo["datetime"].date().isoformat()
+                })
+                last_hop_city = c_name
+
+    compiled_routes_json_list = []
+    for i in range(len(chronological_hops) - 1):
+        h_start = chronological_hops[i]
+        h_end = chronological_hops[i+1]
+        
+        start_date_obj = datetime.fromisoformat(h_start["timestamp_date"]).date()
+        end_date_obj = datetime.fromisoformat(h_end["timestamp_date"]).date()
+        day_idx_start = master_sorted_dates.index(start_date_obj) + 1
+        day_idx_end = master_sorted_dates.index(end_date_obj) + 1
+        days_combined = ",".join(map(str, sorted(list({day_idx_start, day_idx_end}))))
+
+        compiled_routes_json_list.append({
+            "from_name": h_start["city"],
+            "from_id": h_start["city_id"],
+            "from_time": h_start["formatted_time"],
+            "to_name": h_end["city"],
+            "to_id": h_end["city_id"],
+            "to_time": h_end["formatted_time"],
+            "start_coords": city_centroids[h_start["city"]],
+            "end_coords": city_centroids[h_end["city"]],
+            "data_days": days_combined
+        })
 
     max_display_speed = max(int(math.ceil(global_max_speed / 10.0) * 10), 20)
     mymap = folium.Map(tiles=None, prefer_canvas=True)
@@ -399,7 +440,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     <tr><td style="color: #7f8c8d;"><b>Day's Distance:</b></td><td style="text-align: right; font-weight: bold;">{day_dist_km:.1f} km</td></tr>
                     <tr><td style="color: #7f8c8d;"><b>Day's Duration:</b></td><td style="text-align: right; font-weight: bold;">{duration_str}</td></tr>
                     <tr><td style="color: #27ae60;"><b>Day's Avg Speed:</b></td><td style="text-align: right;">{avg_speed_str}</td></tr>
-                    <tr><td style="color: #c0392b;"><b>Day's Max Speed:</b></td><td style="text-align: right; font-weight: bold;">{max_speed_str}</td></tr>
+                    <tr><td style="color: #2c3e50;"><b>Day's Max Speed:</b></td><td style="text-align: right; font-weight: bold;">{max_speed_str}</td></tr>
                     <tr style="border-top: 2px solid #3b82f6; background-color: #f8fafc;">
                         <td style="color: #3b82f6; padding: 4px;"><b>⚡ Section Cruise Speed:</b></td>
                         <td style="text-align: right; color: #3b82f6; font-weight: bold; padding: 4px;">{section_speed_text}</td>
@@ -407,7 +448,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                 </table>
             </div>
             """
-            folium.PolyLine(locations=points, color=color_hex, weight=5, opacity=0.85, tooltip=folium.Tooltip(tooltip_html, sticky=True)).add_to(day_feature_group)
+            folium.PolyLine(locations=points, color=color_hex, weight=5, opacity=0.85, tooltip=folium.Tooltip(tooltip_html, sticky=True), layerType='gpx_track').add_to(day_feature_group)
 
         for global_idx, photo in enumerate(photo_data):
             if photo["datetime"].date() == date:
@@ -424,11 +465,11 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
 
         day_feature_group.add_to(mymap)
 
-    # Global Isolated Structural Pin Layer (De-duplicated macro regional views)
+    # Global Isolated Structural Pin Layer
     pins_feature_group = folium.FeatureGroup(name="Global Region Pins Storage Layer", overlay=True, control=False)
     for city_pin in global_unique_city_pins:
         city_html = f"""
-        <div class="city-marker-wrapper city-pin-marker" data-days="{city_pin['days_list']}">
+        <div class="city-marker-wrapper city-pin-marker" data-city-id="{city_pin['id']}" data-days="{city_pin['days_list']}">
             <span class="city-marker-dot"></span>
             <span class="city-marker-label">{city_pin["name"]}</span>
         </div>
@@ -518,8 +559,25 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         .city-marker-dot { width: 10px; height: 10px; background-color: #ef4444; border: 2px solid #ffffff; border-radius: 50%; box-shadow: 0 2px 8px rgba(0,0,0,0.3); display: inline-block; }
         .city-marker-label { font-family: 'Segoe UI', system-ui, sans-serif; font-size: 11px; font-weight: 700; color: #0f172a; background-color: rgba(255, 255, 255, 0.92); border: 1px solid #e2e8f0; padding: 3px 8px; border-radius: 6px; box-shadow: 0 4px 12px rgba(15,23,42,0.06); margin-left: 6px; backdrop-filter: blur(4px); }
 
+        @keyframes routeFlowAnimation {
+            from { stroke-dashoffset: 24; }
+            to { stroke-dashoffset: 0; }
+        }
+        .travel-route-animated-line {
+            stroke-dasharray: 12, 12 !important;
+            animation: routeFlowAnimation 1.2s linear infinite !important;
+        }
+        .route-arrow-marker-container {
+            display: flex; align-items: center; justify-content: center;
+            width: 24px; height: 24px; pointer-events: none;
+        }
+        .route-bearing-arrow {
+            font-size: 14px; color: #3b82f6; font-family: sans-serif;
+            text-shadow: 0 0 3px #ffffff, 0 0 5px #ffffff, 0 0 8px #ffffff;
+            user-select: none; pointer-events: none; opacity: 0.6;
+        }
+
         body.hide-photos-global .map-photo-marker { display: none !important; pointer-events: none !important; }
-        body.hide-gpx-global .leaflet-overlay-pane canvas { display: none !important; pointer-events: none !important; }
         body.hide-pins-global .city-pin-marker { display: none !important; pointer-events: none !important; }
 
         #global-photo-lightbox {
@@ -558,7 +616,25 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
 
     <script>
     const dynamicPhotoArray = __PHOTO_DATA__;
+    const clientSideRoutesMatrix = __ROUTES_DATA__;
+    const mapGlobalId = '__MAP_NAME__';
+    
+    let windowLevelRouteLayersArray = [];
+    let windowLevelArrowLayersArray = [];
     let currentLightboxIndex = 0;
+
+    function getMap() {
+        if (window.cachedMapInstance) return window.cachedMapInstance;
+        for (let key in window) {
+            try {
+                if (window[key] && typeof L !== 'undefined' && window[key] instanceof L.Map) {
+                    window.cachedMapInstance = window[key];
+                    return window[key];
+                }
+            } catch (e) {}
+        }
+        return null;
+    }
 
     function launchLightboxGallery(index) {
         currentLightboxIndex = index;
@@ -581,7 +657,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         if(dynamicPhotoArray.length === 0) return;
         const currentTarget = dynamicPhotoArray[currentLightboxIndex];
         document.getElementById('lightbox-image-frame').src = currentTarget.full_url;
-        document.getElementById('lightbox-meta-tag').innerHTML = `<b>${currentTarget.filename}</b><br>${currentTarget.formatted_time}`;
+        document.getElementById('lightbox-meta-tag').innerHTML = '<b>' + currentTarget.filename + '</b><br>' + currentTarget.formatted_time;
     }
 
     document.addEventListener('keydown', function(event) {
@@ -616,7 +692,52 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     }
 
+    function initializeClientSideRouteVectors() {
+        const leafletMap = window[mapGlobalId];
+        if (!leafletMap || windowLevelRouteLayersArray.length > 0) return;
+
+        clientSideRoutesMatrix.forEach(route => {
+            const deltaLon = route.end_coords[1] - route.start_coords[1];
+            const deltaLat = route.end_coords[0] - route.start_coords[0];
+            const angleDeg = (Math.atan2(deltaLon, deltaLat) * 180) / Math.PI;
+
+            const midLat = (route.start_coords[0] + route.end_coords[0]) / 2;
+            const midLon = (route.start_coords[1] + route.end_coords[1]) / 2;
+
+            const tooltipHtml = '<div style="font-family: sans-serif; width: 240px; font-size: 13px; color: #333; padding: 4px;">' +
+                '<h4 style="margin: 0 0 6px 0; color: #2563eb; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px;">🛣️ <b>Travel Route Vector</b></h4>' +
+                '<table style="width: 100%; border-collapse: collapse; line-height: 1.4;">' +
+                    '<tr><td style="color: #64748b;"><b>From:</b></td><td style="text-align: right; font-weight: bold; color: #1e293b;">' + route.from_name + '</td></tr>' +
+                    '<tr><td style="color: #64748b;"><b>Time:</b></td><td style="text-align: right; font-size: 11px; color: #475569;">' + route.from_time + '</td></tr>' +
+                    '<tr style="border-top: 1px solid #f1f5f9;"><td style="color: #64748b; padding-top: 6px;"><b>To:</b></td><td style="text-align: right; font-weight: bold; color: #1e293b;">' + route.to_name + '</td></tr>' +
+                    '<tr><td style="color: #64748b;"><b>Time:</b></td><td style="text-align: right; font-size: 11px; color: #475569;">' + route.to_time + '</td></tr>' +
+                '</table>' +
+            '</div>';
+
+            const polyLineInstance = L.polyline([route.start_coords, route.end_coords], {
+                color: '#3b82f6', weight: 4, opacity: 0.4, className: 'travel-route-animated-line'
+            }).bindTooltip(tooltipHtml, {sticky: true}).addTo(leafletMap);
+
+            const arrowHtml = '<div class="route-arrow-marker-container"><div class="route-bearing-arrow" style="transform: rotate(' + angleDeg + 'deg);">▲</div></div>';
+            // --- FIXED: ADDED className: '' TO PREVENT LEAFLET FROM DRAWING THE WHITE DEFAULT BOX ---
+            const arrowIcon = L.divIcon({html: arrowHtml, iconSize: [24, 24], iconAnchor: [12, 12], className: ''});
+            const arrowMarkerInstance = L.marker([midLat, midLon], {icon: arrowIcon}).addTo(leafletMap);
+
+            polyLineInstance.customMetaFromId = route.from_id;
+            polyLineInstance.customMetaToId = route.to_id;
+            
+            arrowMarkerInstance.customMetaFromId = route.from_id;
+            arrowMarkerInstance.customMetaToId = route.to_id;
+
+            windowLevelRouteLayersArray.push(polyLineInstance);
+            windowLevelArrowLayersArray.push(arrowMarkerInstance);
+        });
+    }
+
     function updatePinVisibility() {
+        const leafletMap = window[mapGlobalId];
+        if (!leafletMap) return;
+
         const labels = document.querySelectorAll('.leaflet-control-layers-overlays label');
         const activeDays = new Set();
         
@@ -626,24 +747,57 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                 const titleSpan = label.querySelector('.timeline-day-title');
                 if (titleSpan) {
                     const match = titleSpan.innerText.match(/Day\\s+(\\d+)/i);
-                    if (match) {
-                        activeDays.add(parseInt(match[1], 10));
-                    }
+                    if (match) activeDays.add(parseInt(match[1], 10));
                 }
             }
         });
 
+        const activeCityIds = new Set();
+
         const pinElements = document.querySelectorAll('.city-pin-marker');
         pinElements.forEach(pin => {
             const daysAttr = pin.getAttribute('data-days');
+            const cityId = pin.getAttribute('data-city-id');
             if (!daysAttr) return;
             
             const pinDays = daysAttr.split(',').map(Number);
             const isVisible = pinDays.some(d => activeDays.has(d));
             
+            if (isVisible && cityId) activeCityIds.add(cityId);
+            
             const markerWrapper = pin.closest('.leaflet-marker-icon');
             if (markerWrapper) {
                 markerWrapper.style.setProperty('display', isVisible ? 'block' : 'none', 'important');
+            }
+        });
+
+        const showGpxGlobal = document.getElementById('global-filter-gpx').checked;
+        const showRouteGlobal = document.getElementById('global-filter-route').checked;
+
+        leafletMap.eachLayer(function(layer) {
+            if (layer.options && layer.options.layerType === 'gpx_track') {
+                layer.setStyle({
+                    opacity: showGpxGlobal ? 0.85 : 0,
+                    weight: showGpxGlobal ? 5 : 0
+                });
+            }
+        });
+
+        windowLevelRouteLayersArray.forEach(line => {
+            const bothPinsVisible = activeCityIds.has(line.customMetaFromId) && activeCityIds.has(line.customMetaToId);
+            const renderActive = showRouteGlobal && bothPinsVisible;
+            line.setStyle({
+                opacity: renderActive ? 0.4 : 0,
+                weight: renderActive ? 4 : 0
+            });
+        });
+
+        windowLevelArrowLayersArray.forEach(arrow => {
+            const bothPinsVisible = activeCityIds.has(arrow.customMetaFromId) && activeCityIds.has(arrow.customMetaToId);
+            const renderActive = showRouteGlobal && bothPinsVisible;
+            const arrowDomElement = arrow.getElement();
+            if (arrowDomElement) {
+                arrowDomElement.style.setProperty('display', renderActive ? 'block' : 'none', 'important');
             }
         });
     }
@@ -658,27 +812,24 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             headerBlock.style.width = '100%';
             headerBlock.style.boxSizing = 'border-box';
             
-            headerBlock.innerHTML = `
-                <h4 style="margin:0 0 10px 0; color:#1e293b; font-size:15px; border-bottom: 2px solid #3b82f6; padding-bottom: 6px;">
-                    🚀 <b>Journey Dashboard</b>
-                </h4>
-                <table style="width:100%; border-collapse:collapse; line-height:1.7; font-size:13px; margin-bottom: 12px;">
-                    <tr><td style="color:#64748b;"><b>Total Timeline:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">__TOTAL_DAYS__ Days</td></tr>
-                    <tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">__TOTAL_DURATION__</td></tr>
-                    <tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">__TOTAL_DISTANCE__ km</td></tr>
-                </table>
-                <div style="display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-start; margin-top: 10px; padding-top: 10px; border-top: 1px solid #edf2f7; margin-bottom: 4px;">
-                    <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">
-                        <input type="checkbox" id="global-filter-gpx" checked style="cursor: pointer; width: 13px; height: 13px;"> 🚗 Tracks
-                    </label>
-                    <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">
-                        <input type="checkbox" id="global-filter-photos" checked style="cursor: pointer; width: 13px; height: 13px;"> 📸 Photos
-                    </label>
-                    <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">
-                        <input type="checkbox" id="global-filter-pins" checked style="cursor: pointer; width: 13px; height: 13px;"> 📍 Pins
-                    </label>
-                </div>
-            `;
+            headerBlock.innerHTML = '<h4 style="margin:0 0 10px 0; color:#1e293b; font-size:15px; border-bottom: 2px solid #3b82f6; padding-bottom: 6px;">' +
+                '🚀 <b>Journey Dashboard</b></h4>' +
+                '<table style="width:100%; border-collapse:collapse; line-height:1.7; font-size:13px; margin-bottom: 12px;">' +
+                '<tr><td style="color:#64748b;"><b>Total Timeline:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">__TOTAL_DAYS__ Days</td></tr>' +
+                '<tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">__TOTAL_DURATION__</td></tr>' +
+                '<tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">__TOTAL_DISTANCE__ km</td></tr>' +
+                '</table>' +
+                '<div style="display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-start; margin-top: 10px; padding-top: 10px; border-top: 1px solid #edf2f7; margin-bottom: 4px;">' +
+                '<label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">' +
+                '<input type="checkbox" id="global-filter-gpx" checked style="cursor: pointer; width: 13px; height: 13px;"> 🚗 Tracks</label>' +
+                '<label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">' +
+                '<input type="checkbox" id="global-filter-photos" checked style="cursor: pointer; width: 13px; height: 13px;"> 📸 Photos</label>' +
+                '<label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">' +
+                '<input type="checkbox" id="global-filter-pins" checked style="cursor: pointer; width: 13px; height: 13px;"> 📍 Pins</label>' +
+                '<label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">' +
+                '<input type="checkbox" id="global-filter-route" checked style="cursor: pointer; width: 13px; height: 13px;"> 🛣️ Route</label>' +
+                '</div>';
+            
             masterPanel.insertBefore(headerBlock, masterPanel.firstChild);
 
             var formList = masterPanel.querySelector('.leaflet-control-layers-list');
@@ -695,10 +846,9 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                 timelineHeader.style.borderTop = '1px solid #e2e8f0';
                 timelineHeader.style.cursor = 'pointer';
                 timelineHeader.style.userSelect = 'none';
-                timelineHeader.innerHTML = `
-                    <span style="font-weight: 700; color: #1e293b; font-size: 13px;">🗺️ Trip Timeline</span>
-                    <span id="timeline-chevron" style="font-size: 11px; color: #64748b; transition: transform 0.2s ease; display: inline-block;">▼</span>
-                `;
+                timelineHeader.innerHTML = '<span style="font-weight: 700; color: #1e293b; font-size: 13px;">🗺️ Trip Timeline</span>' +
+                    '<span id="timeline-chevron" style="font-size: 11px; color: #64748b; transition: transform 0.2s ease; display: inline-block;">▼</span>';
+                
                 formList.insertBefore(timelineHeader, overlaysContainer);
 
                 var toggleRow = document.createElement('div');
@@ -709,64 +859,40 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                 toggleRow.style.marginBottom = '12px';
                 toggleRow.style.paddingLeft = '2px';
                 toggleRow.style.transition = 'max-height 0.22s ease, opacity 0.15s ease, margin 0.22s ease';
-                toggleRow.innerHTML = `
-                    <span id="map-select-all" style="font-size: 11px; color: #3b82f6; cursor: pointer; font-weight: 600; user-select: none;">✓ Select All</span>
-                    <span id="map-deselect-all" style="font-size: 11px; color: #64748b; cursor: pointer; font-weight: 600; user-select: none;">✕ Deselect All</span>
-                `;
+                toggleRow.innerHTML = '<span id="map-select-all" style="font-size: 11px; color: #3b82f6; cursor: pointer; font-weight: 600; user-select: none;">✓ Select All</span>' +
+                    '<span id="map-deselect-all" style="font-size: 11px; color: #64748b; cursor: pointer; font-weight: 600; user-select: none;">✕ Deselect All</span>';
+                
                 formList.insertBefore(toggleRow, overlaysContainer);
 
                 timelineHeader.addEventListener('click', function() {
                     masterPanel.classList.toggle('timeline-collapsed');
                 });
                 
-                document.getElementById('global-filter-gpx').addEventListener('change', function(e) {
-                    if (e.target.checked) {
-                        document.body.classList.remove('hide-gpx-global');
-                    } else {
-                        document.body.classList.add('hide-gpx-global');
-                    }
-                });
-
+                document.getElementById('global-filter-gpx').addEventListener('change', updatePinVisibility);
                 document.getElementById('global-filter-photos').addEventListener('change', function(e) {
-                    if (e.target.checked) {
-                        document.body.classList.remove('hide-photos-global');
-                    } else {
-                        document.body.classList.add('hide-photos-global');
-                    }
+                    if (e.target.checked) { document.body.classList.remove('hide-photos-global'); }
+                    else { document.body.classList.add('hide-photos-global'); }
                 });
-
                 document.getElementById('global-filter-pins').addEventListener('change', function(e) {
-                    if (e.target.checked) {
-                        document.body.classList.remove('hide-pins-global');
-                    } else {
-                        document.body.classList.add('hide-pins-global');
-                    }
+                    if (e.target.checked) { document.body.classList.remove('hide-pins-global'); }
+                    else { document.body.classList.add('hide-pins-global'); }
                 });
+                document.getElementById('global-filter-route').addEventListener('change', updatePinVisibility);
 
                 document.getElementById('map-select-all').addEventListener('click', function(ev) {
                     ev.stopPropagation();
                     var checkboxes = overlaysContainer.querySelectorAll('input[type="checkbox"]');
-                    checkboxes.forEach(function(cb) {
-                        if (!cb.checked) {
-                            cb.click();
-                        }
-                    });
+                    checkboxes.forEach(function(cb) { if (!cb.checked) cb.click(); });
                     setTimeout(updatePinVisibility, 80);
                 });
                 
                 document.getElementById('map-deselect-all').addEventListener('click', function(ev) {
                     ev.stopPropagation();
                     var checkboxes = overlaysContainer.querySelectorAll('input[type="checkbox"]');
-                    checkboxes.forEach(function(cb) {
-                        if (cb.checked) {
-                            cb.click();
-                        }
-                    });
+                    checkboxes.forEach(function(cb) { if (cb.checked) cb.click(); });
                     setTimeout(updatePinVisibility, 80);
                 });
             }
-        } else {
-            setTimeout(compileUnifiedLeftDashboard, 100);
         }
     }
 
@@ -774,20 +900,27 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         var stylePanel = document.querySelector('.leaflet-control-layers-base');
         if (stylePanel) {
             stylePanel.addEventListener('click', function(event) {
-                if (event.target.tagName === 'INPUT' || event.target.closest('label')) {
-                    return;
-                }
+                if (event.target.tagName === 'INPUT' || event.target.closest('label')) return;
                 this.classList.toggle('active-click');
                 event.stopPropagation();
             });
-            
             document.addEventListener('click', function(event) {
-                if (!stylePanel.contains(event.target)) {
-                    stylePanel.classList.remove('active-click');
-                }
+                if (!stylePanel.contains(event.target)) stylePanel.classList.remove('active-click');
             });
+        }
+    }
+
+    function initVisibilitySync() {
+        const leafletMap = window[mapGlobalId];
+        const layersControlDom = document.querySelector('.leaflet-control-layers');
+        
+        if (leafletMap && layersControlDom) {
+            initializeClientSideRouteVectors();
+            compileUnifiedLeftDashboard();
+            setupRightStylePanel();
+            updatePinVisibility();
         } else {
-            setTimeout(setupRightStylePanel, 100);
+            setTimeout(initVisibilitySync, 100);
         }
     }
 
@@ -797,18 +930,21 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         }
     });
 
-    compileUnifiedLeftDashboard();
-    setupRightStylePanel();
-    setTimeout(updatePinVisibility, 200);
+    initVisibilitySync();
     </script>
     """
     
-    ui_javascript_injector = raw_js_template.replace("__PHOTO_DATA__", str([{k: v for k, v in p.items() if k not in ('datetime', 'assigned_city')} for p in photo_data]))
+    clean_photo_data = [{k: v for k, v in p.items() if k not in ('datetime', 'assigned_city')} for p in photo_data]
+    ui_javascript_injector = raw_js_template.replace("__PHOTO_DATA__", json.dumps(clean_photo_data))
+    ui_javascript_injector = ui_javascript_injector.replace("__ROUTES_DATA__", json.dumps(compiled_routes_json_list))
     ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DAYS__", str(len(master_sorted_dates)))
     ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DURATION__", format_duration(grand_total_seconds))
     ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DISTANCE__", f"{grand_total_distance_km:.1f}")
+    ui_javascript_injector = ui_javascript_injector.replace("__MAP_NAME__", mymap.get_name())
 
     mymap.get_root().html.add_child(folium.Element(ui_javascript_injector))
+
+    mymap.get_root().html.add_child(folium.Element(f"<script>window.globalLeafletMap = {mymap.get_name()};</script>"))
 
     title_html = """
     <div style="position: fixed; 
@@ -831,7 +967,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Obfuscated city-name pin configuration saved to: '{output_html}'")
+    print(f"🎉 Success! Completely robust client-side visualization compiled safely to: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
