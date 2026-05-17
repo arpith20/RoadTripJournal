@@ -220,7 +220,7 @@ def process_gpx_to_chunked_days(folder_path):
     return daily_data
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
-    """Generates an optimized web map featuring interactive card containers and split-performance photos grouped by day."""
+    """Generates an optimized web map featuring an absolute spatial anchor for the first stacked image."""
     gpx_dates = set(daily_data.keys())
     photo_dates = {p["datetime"].date() for p in photo_data}
     master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
@@ -237,6 +237,44 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         grand_total_seconds += day['total_seconds']
         if day['max_speed'] > global_max_speed:
             global_max_speed = day['max_speed']
+
+    print("🛠️  Step 1.8: Pre-processing photos to fan-out grouped stacks around their true anchor...")
+    photos_by_date = defaultdict(list)
+    for p_idx, p_data in enumerate(photo_data):
+        photos_by_date[p_data["datetime"].date()].append(p_idx)
+
+    radius_offset_degrees = 0.00012 # Tight, clean separation radius (~12-14 meters)
+
+    for date, indices in photos_by_date.items():
+        if len(indices) < 2: continue
+        spacial_stacks = defaultdict(list)
+        for idx in indices:
+            rounded_lat = round(photo_data[idx]['lat'], 5)
+            rounded_lon = round(photo_data[idx]['lon'], 5)
+            spacial_stacks[(rounded_lat, rounded_lon)].append(idx)
+
+        for base_coords, stack_indices in spacial_stacks.items():
+            stack_size = len(stack_indices)
+            if stack_size > 1:
+                # --- UPDATE: LOCK DOWN THE TRUE UNROUNDED ANCHOR ---
+                # We extract the absolute unrounded coordinates of the first image
+                anchor_idx = stack_indices[0]
+                base_lat = photo_data[anchor_idx]['lat']
+                base_lon = photo_data[anchor_idx]['lon']
+                
+                lon_correction = 1.0 / math.cos(math.radians(base_lat)) if -90 < base_lat < 90 else 1.0
+
+                for group_idx, target_photo_idx in enumerate(stack_indices):
+                    # Image 0 stays strictly on the original unrounded spot
+                    if group_idx == 0: continue
+                    
+                    # Beautifully distribute the rest around the true anchor image
+                    angle = (2 * math.pi * (group_idx - 1)) / (stack_size - 1)
+                    offset_lat = radius_offset_degrees * math.sin(angle)
+                    offset_lon = radius_offset_degrees * math.cos(angle) * lon_correction
+                    
+                    photo_data[target_photo_idx]['lat'] = base_lat + offset_lat
+                    photo_data[target_photo_idx]['lon'] = base_lon + offset_lon
 
     for photo in photo_data:
         all_coords.append((photo["lat"], photo["lon"]))
@@ -267,7 +305,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         })
         
         day_dist_km = day['distance_m'] / 1000.0
-        
         if day['total_seconds'] > 0:
             day_avg_speed = (day_dist_km / (day['total_seconds'] / 3600.0))
             avg_speed_str = f"{day_avg_speed:.1f} km/h"
@@ -319,7 +356,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     <img src='{photo["thumb_url"]}' class='map-photo-marker' onclick='launchLightboxGallery({global_idx})' loading='lazy' />
                 """
                 custom_icon = folium.DivIcon(html=icon_html, icon_size=(44, 44), icon_anchor=(22, 22))
-                
                 tooltip_html = f"""
                     <div style="font-family: 'Segoe UI', sans-serif; font-size: 12px; padding: 2px; color: #1e293b; white-space: nowrap;">
                         <span style="font-weight: 500; color: #1e293b;">{photo["formatted_time"]}</span>
@@ -334,7 +370,6 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
 
     folium.LayerControl(collapsed=False).add_to(mymap)
 
-    # UI Comprehensive Layout Stylesheet Override
     ui_css_override = """
     <style>
         .leaflet-control-layers {
@@ -394,10 +429,8 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         .leaflet-control-layers-selector[type="radio"]:checked::after { content: ''; position: absolute; width: 8px; height: 8px; background-color: #3b82f6; border-radius: 50%; top: 3px; left: 3px; }
 
         .map-photo-marker {
-            width: 44px; height: 44px;
-            border: 3px solid #ffffff; border-radius: 10px;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.18);
-            object-fit: cover; cursor: pointer;
+            width: 44px; height: 44px; border: 3px solid #ffffff; border-radius: 10px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.18); object-fit: cover; cursor: pointer;
             transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.2s;
         }
         .map-photo-marker:hover {
@@ -409,57 +442,38 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         .leaflet-interactive:focus,
         .map-photo-marker,
         .map-photo-marker:focus {
-            outline: none !important;
-            box-shadow: none !important;
-            -webkit-tap-highlight-color: transparent;
+            outline: none !important; box-shadow: none !important; -webkit-tap-highlight-color: transparent;
         }
 
-        body.hide-photos-global .map-photo-marker {
-            display: none !important;
-            pointer-events: none !important;
-        }
-        
-        /* --- UI FIX: TARGET THE CANVAS OVERLAY ELEMENT EXCLUSIVELY --- */
-        body.hide-gpx-global .leaflet-overlay-pane canvas {
-            display: none !important;
-            pointer-events: none !important;
-        }
+        body.hide-photos-global .map-photo-marker { display: none !important; pointer-events: none !important; }
+        body.hide-gpx-global .leaflet-overlay-pane canvas { display: none !important; pointer-events: none !important; }
 
         #global-photo-lightbox {
-            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            background-color: rgba(15, 23, 42, 0.95); 
-            z-index: 9999999; display: none; align-items: center; justify-content: center;
-            font-family: 'Segoe UI', system-ui, sans-serif;
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(15, 23, 42, 0.95); 
+            z-index: 9999999; display: none; align-items: center; justify-content: center; font-family: 'Segoe UI', system-ui, sans-serif;
         }
         #lightbox-image-frame {
-            max-width: 85%; max-height: 80%;
-            border-radius: 8px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            max-width: 85%; max-height: 80%; border-radius: 8px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
             object-fit: contain; user-select: none; -webkit-user-drag: none;
         }
         .lightbox-control-btn {
-            position: absolute; color: #f8fafc; font-size: 28px; font-weight: 300;
-            width: 56px; height: 56px; line-height: 52px; background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.1); border-radius: 50%; text-align: center;
-            cursor: pointer; user-select: none; transition: background 0.15s, transform 0.1s;
+            position: absolute; color: #f8fafc; font-size: 28px; font-weight: 300; width: 56px; height: 56px; line-height: 52px; background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.1); border-radius: 50%; text-align: center; cursor: pointer; user-select: none; transition: background 0.15s, transform 0.1s;
         }
         .lightbox-control-btn:hover { background: rgba(255,255,255,0.15); }
         .lightbox-control-btn:active { transform: scale(0.95); }
         #lightbox-left-arrow { left: 40px; }
         #lightbox-right-arrow { right: 40px; }
         #lightbox-close-btn { top: 30px; right: 40px; font-size: 22px; }
-        
         #lightbox-meta-tag {
-            position: absolute; bottom: 40px; color: #e2e8f0; font-size: 14px;
-            background: rgba(0,0,0,0.4); padding: 8px 20px; border-radius: 20px;
-            backdrop-filter: blur(4px); pointer-events: none; text-align: center;
+            position: absolute; bottom: 40px; color: #e2e8f0; font-size: 14px; background: rgba(0,0,0,0.4); padding: 8px 20px; border-radius: 20px; backdrop-filter: blur(4px); pointer-events: none; text-align: center;
         }
     </style>
     """
     mymap.get_root().header.add_child(folium.Element(ui_css_override))
     mymap.get_root().header.add_child(folium.Element("<title>Road Trip Journal</title>"))
 
-    # JavaScript controller injection block
-    ui_javascript_injector = f"""
+    raw_js_template = """
     <div id="global-photo-lightbox">
         <span class="lightbox-control-btn" id="lightbox-close-btn" onclick="closeLightboxGallery()">✕</span>
         <span class="lightbox-control-btn" id="lightbox-left-arrow" onclick="navigateLightbox(-1)">‹</span>
@@ -469,70 +483,70 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
     </div>
 
     <script>
-    const dynamicPhotoArray = {str([{k: v for k, v in p.items() if k != 'datetime'} for p in photo_data])};
+    const dynamicPhotoArray = __PHOTO_DATA__;
     let currentLightboxIndex = 0;
 
-    function launchLightboxGallery(index) {{
+    function launchLightboxGallery(index) {
         currentLightboxIndex = index;
         updateLightboxDisplay();
         document.getElementById('global-photo-lightbox').style.display = 'flex';
-    }}
+    }
 
-    function closeLightboxGallery() {{
+    function closeLightboxGallery() {
         document.getElementById('global-photo-lightbox').style.display = 'none';
-    }}
+    }
 
-    function navigateLightbox(direction) {{
+    function navigateLightbox(direction) {
         currentLightboxIndex += direction;
         if (currentLightboxIndex >= dynamicPhotoArray.length) currentLightboxIndex = 0;
         if (currentLightboxIndex < 0) currentLightboxIndex = dynamicPhotoArray.length - 1;
         updateLightboxDisplay();
-    }}
+    }
 
-    function updateLightboxDisplay() {{
+    function updateLightboxDisplay() {
         if(dynamicPhotoArray.length === 0) return;
         const currentTarget = dynamicPhotoArray[currentLightboxIndex];
         document.getElementById('lightbox-image-frame').src = currentTarget.full_url;
-        document.getElementById('lightbox-meta-tag').innerHTML = `<b>${{currentTarget.filename}}</b><br>${{currentTarget.formatted_time}}`;
-    }}
+        document.getElementById('lightbox-meta-tag').innerHTML = `<b>${currentTarget.filename}</b><br>${currentTarget.formatted_time}`;
+    }
 
-    document.addEventListener('keydown', function(event) {{
+    document.addEventListener('keydown', function(event) {
         const lightboxView = document.getElementById('global-photo-lightbox');
-        if (lightboxView.style.display === 'flex') {{
+        if (lightboxView.style.display === 'flex') {
             if (event.key === 'ArrowRight') navigateLightbox(1);
             if (event.key === 'ArrowLeft') navigateLightbox(-1);
             if (event.key === 'Escape') closeLightboxGallery();
-        }}
-    }});
+        }
+    });
 
     let touchStartAxisX = 0;
     let touchEndAxisX = 0;
     const lightboxFrame = document.getElementById('global-photo-lightbox');
     
-    lightboxFrame.addEventListener('touchstart', e => {{
+    lightboxFrame.addEventListener('touchstart', e => {
         touchStartAxisX = e.changedTouches[0].screenX;
-    }}, {{passive: true}});
+    }, {passive: true});
 
-    lightboxFrame.addEventListener('touchend', e => {{
+    lightboxFrame.addEventListener('touchend', e => {
         touchEndAxisX = e.changedTouches[0].screenX;
         handleSwipeGesture();
-    }}, {{passive: true}});
+    }, {passive: true});
 
-    function handleSwipeGesture() {{
+    function handleSwipeGesture() {
         const deltaThreshold = 50;
-        if (touchStartAxisX - touchEndAxisX > deltaThreshold) {{
+        if (touchStartAxisX - touchEndAxisX > deltaThreshold) {
             navigateLightbox(1);
-        }}
-        if (touchEndAxisX - touchStartAxisX > deltaThreshold) {{
+        }
+        if (touchEndAxisX - touchStartAxisX > deltaThreshold) {
             navigateLightbox(-1);
-        }}
-    }}
+        }
+    }
 
-    function compileUnifiedLeftDashboard() {{
+    function compileUnifiedLeftDashboard() {
         var masterPanel = document.querySelector('.leaflet-control-layers');
         var stylePanel = document.querySelector('.leaflet-control-layers-base');
         
-        if (masterPanel && stylePanel) {{
+        if (masterPanel && stylePanel) {
             var headerBlock = document.createElement('div');
             headerBlock.style.width = '100%';
             headerBlock.style.boxSizing = 'border-box';
@@ -542,9 +556,9 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     🚀 <b>Journey Dashboard</b>
                 </h4>
                 <table style="width:100%; border-collapse:collapse; line-height:1.7; font-size:13px; margin-bottom: 12px;">
-                    <tr><td style="color:#64748b;"><b>Total Timeline:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{len(master_sorted_dates)} Days</td></tr>
-                    <tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{format_duration(grand_total_seconds)}</td></tr>
-                    <tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">{grand_total_distance_km:.1f} km</td></tr>
+                    <tr><td style="color:#64748b;"><b>Total Timeline:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">__TOTAL_DAYS__ Days</td></tr>
+                    <tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">__TOTAL_DURATION__</td></tr>
+                    <tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">__TOTAL_DISTANCE__ km</td></tr>
                 </table>
                 <div style="display: flex; gap: 16px; justify-content: flex-start; margin-top: 10px; padding-top: 10px; border-top: 1px solid #edf2f7; margin-bottom: 4px;">
                     <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; font-weight: 600; color: #475569; user-select: none;">
@@ -560,7 +574,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             var formList = masterPanel.querySelector('.leaflet-control-layers-list');
             var overlaysContainer = masterPanel.querySelector('.leaflet-control-layers-overlays');
             
-            if (formList && overlaysContainer) {{
+            if (formList && overlaysContainer) {
                 var timelineHeader = document.createElement('div');
                 timelineHeader.id = 'timeline-toggle-header';
                 timelineHeader.style.display = 'flex';
@@ -591,67 +605,74 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                 `;
                 formList.insertBefore(toggleRow, overlaysContainer);
 
-                timelineHeader.addEventListener('click', function() {{
+                timelineHeader.addEventListener('click', function() {
                     masterPanel.classList.toggle('timeline-collapsed');
-                }});
+                });
                 
-                document.getElementById('global-filter-gpx').addEventListener('change', function(e) {{
-                    if (e.target.checked) {{
+                document.getElementById('global-filter-gpx').addEventListener('change', function(e) {
+                    if (e.target.checked) {
                         document.body.classList.remove('hide-gpx-global');
-                    }} else {{
+                    } else {
                         document.body.classList.add('hide-gpx-global');
-                    }}
-                }});
+                    }
+                });
 
-                document.getElementById('global-filter-photos').addEventListener('change', function(e) {{
-                    if (e.target.checked) {{
+                document.getElementById('global-filter-photos').addEventListener('change', function(e) {
+                    if (e.target.checked) {
                         document.body.classList.remove('hide-photos-global');
-                    }} else {{
+                    } else {
                         document.body.classList.add('hide-photos-global');
-                    }}
-                }});
+                    }
+                });
 
-                document.getElementById('map-select-all').addEventListener('click', function(ev) {{
+                document.getElementById('map-select-all').addEventListener('click', function(ev) {
                     ev.stopPropagation();
                     var checkboxes = overlaysContainer.querySelectorAll('input[type="checkbox"]');
-                    checkboxes.forEach(function(cb) {{
-                        if (!cb.checked) {{
+                    checkboxes.forEach(function(cb) {
+                        if (!cb.checked) {
                             cb.click();
-                        }}
-                    }});
-                }});
+                        }
+                    });
+                });
                 
-                document.getElementById('map-deselect-all').addEventListener('click', function(ev) {{
+                document.getElementById('map-deselect-all').addEventListener('click', function(ev) {
                     ev.stopPropagation();
                     var checkboxes = overlaysContainer.querySelectorAll('input[type="checkbox"]');
-                    checkboxes.forEach(function(cb) {{
-                        if (cb.checked) {{
+                    checkboxes.forEach(function(cb) {
+                        if (cb.checked) {
                             cb.click();
-                        }}
-                    }});
-                }});
-            }}
+                        }
+                    });
+                });
+            }
 
-            stylePanel.addEventListener('click', function(event) {{
-                if (event.target.tagName === 'INPUT' || event.target.closest('label')) {{
+            stylePanel.addEventListener('click', function(event) {
+                if (event.target.tagName === 'INPUT' || event.target.closest('label')) {
                     return;
-                }}
+                }
                 this.classList.toggle('active-click');
                 event.stopPropagation();
-            }});
+            });
             
-            document.addEventListener('click', function(event) {{
-                if (!stylePanel.contains(event.target)) {{
+            document.addEventListener('click', function(event) {
+                if (!stylePanel.contains(event.target)) {
                     stylePanel.classList.remove('active-click');
-                }}
-            }});
-        }} else {{
+                }
+            });
+        } else {
             setTimeout(compileUnifiedLeftDashboard, 100);
-        }}
-    }}
+        }
+    }
     compileUnifiedLeftDashboard();
     </script>
     """
+    
+    serialized_array = str([{k: v for k, v in p.items() if k != 'datetime'} for p in photo_data])
+    ui_javascript_injector = raw_js_template.replace("__PHOTO_DATA__", serialized_array)
+    ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DAYS__", str(len(master_sorted_dates)))
+    ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DURATION__", format_duration(grand_total_seconds))
+    ui_javascript_injector = ui_javascript_injector.replace("__TOTAL_DISTANCE__", f"{grand_total_distance_km:.1f}")
+
     mymap.get_root().html.add_child(folium.Element(ui_javascript_injector))
 
     title_html = """
@@ -675,7 +696,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! High-performance rendering engine layer control fixed. Output written: '{output_html}'")
+    print(f"🎉 Success! Completely path-proof rendering setup written to: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
