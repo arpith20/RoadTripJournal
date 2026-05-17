@@ -5,6 +5,7 @@ from collections import defaultdict
 import gpxpy
 import folium
 import branca.colormap as cm
+from PIL import Image, ImageOps
 
 def calculate_speed(p1, p2):
     """Calculates speed between two sequential points in km/h."""
@@ -20,6 +21,112 @@ def format_duration(seconds):
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     return f"{hours}h {minutes}m"
+
+def extract_image_metadata(image_path):
+    """Extracts geographic coordinates and capture time from image EXIF headers."""
+    try:
+        with Image.open(image_path) as img:
+            exif = img._getexif()
+            if not exif:
+                return None
+            
+            lat_ref = exif.get(1)
+            lat_data = exif.get(2)
+            lon_ref = exif.get(3)
+            lon_data = exif.get(4)
+            dt_data = exif.get(36867) or exif.get(306)
+
+            if not (lat_ref and lat_data and lon_ref and lon_data):
+                gps_dict = exif.get(34853)
+                if isinstance(gps_dict, dict):
+                    lat_ref = gps_dict.get(1)
+                    lat_data = gps_dict.get(2)
+                    lon_ref = gps_dict.get(3)
+                    lon_data = gps_dict.get(4)
+                else:
+                    return None
+
+            if not (lat_ref and lat_data and lon_ref and lon_data):
+                return None
+
+            def convert_to_degrees(value):
+                d = float(value[0])
+                m = float(value[1])
+                s = float(value[2])
+                return d + (m / 60.0) + (s / 3600.0)
+
+            lat = convert_to_degrees(lat_data)
+            if lat_ref in ['S', b'S']: lat = -lat
+            lon = convert_to_degrees(lon_data)
+            if lon_ref in ['W', b'W']: lon = -lon
+
+            dt_obj = None
+            if dt_data:
+                if isinstance(dt_data, bytes):
+                    dt_data = dt_data.decode('utf-8')
+                try:
+                    dt_obj = datetime.strptime(dt_data.strip(), '%Y:%m:%d %H:%M:%S')
+                except ValueError:
+                    pass
+            
+            if not dt_obj:
+                dt_obj = datetime.fromtimestamp(os.path.getmtime(image_path))
+
+            return {"lat": lat, "lon": lon, "datetime": dt_obj}
+    except Exception:
+        return None
+
+def process_images_folder(image_folder, thumb_folder):
+    """Scans image folder, completely clears the thumbnail directory, and rebuilds all active thumbnails."""
+    valid_photos = []
+    if not os.path.exists(image_folder):
+        return []
+    
+    os.makedirs(thumb_folder, exist_ok=True)
+    
+    # --- UPDATE: COMPLETELY PURGE ALL CONTENT IN THUMBNAILS FOR A FRESH REBUILD ---
+    print("🧹 Step 1.2: Wiping thumbnail directory completely for a fresh rebuild...")
+    for filename in os.listdir(thumb_folder):
+        file_path = os.path.join(thumb_folder, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            print(f"  Warning: Could not remove cached file {filename}: {e}")
+
+    active_source_images = {f for f in os.listdir(image_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))}
+
+    print("📷 Step 1.5: Analyzing telemetry data and rebuilding map thumbnails from scratch...")
+    for file_name in active_source_images:
+        file_path = os.path.join(image_folder, file_name)
+        thumb_path = os.path.join(thumb_folder, file_name)
+        
+        meta = extract_image_metadata(file_path)
+        if meta:
+            # --- UPDATE: REMOVED ONDEMAND SKIP CHECK TO ENFORCE SYSTEM REBUILDS ---
+            try:
+                with Image.open(file_path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    img.thumbnail((120, 120))
+                    img.save(thumb_path, "JPEG", quality=85)
+            except Exception as e:
+                print(f"  Skipping thumbnail generation for {file_name}: {e}")
+                continue
+
+            valid_photos.append({
+                "filename": file_name,
+                "thumb_url": f"thumbnails/{file_name}",
+                "full_url": f"images/{file_name}",
+                "lat": meta["lat"],
+                "lon": meta["lon"],
+                "datetime": meta["datetime"],
+                "formatted_time": meta["datetime"].strftime('%b %d, %Y • %I:%M %p')
+            })
+            
+    valid_photos.sort(key=lambda x: x["datetime"])
+    return valid_photos
 
 def process_gpx_to_chunked_days(folder_path):
     """Parses GPX files, handles timeless files gracefully, and chunks speed profiles."""
@@ -55,33 +162,23 @@ def process_gpx_to_chunked_days(folder_path):
                 if len(track_points) < 2:
                     continue
                 
-                # Check if this specific file possesses timestamp streams
                 has_time = track_points[0].time is not None and track_points[-1].time is not None
-                
                 if has_time:
                     segment_date = track_points[0].time.date()
                 else:
-                    # Fallback: Use file modified calendar date if GPS timestamps are empty
                     segment_date = datetime.fromtimestamp(os.path.getmtime(file_path)).date()
                 
                 day_bucket = daily_data[segment_date]
                 
-                # PIPELINE A: Handle Timeless/Planned Routes
                 if not has_time:
                     chunk_coords = [(p.latitude, p.longitude) for p in track_points]
                     day_bucket['full_coords'].extend(chunk_coords)
-                    
-                    # Accumulate path travel distance exclusively
                     for i in range(len(track_points) - 1):
                         day_bucket['distance_m'] += track_points[i].distance_2d(track_points[i+1])
-                    
-                    # Store as a single chunk using -1.0 as a flag for timeless data
                     day_bucket['chunks'].append((chunk_coords, -1.0))
                     continue
                 
-                # PIPELINE B: Handle Standard Recorded GPS Logs
                 day_bucket['total_seconds'] += (track_points[-1].time - track_points[0].time).total_seconds()
-                
                 current_chunk_coords = []
                 current_speed_bucket = None
                 speeds_in_chunk = []
@@ -89,23 +186,18 @@ def process_gpx_to_chunked_days(folder_path):
                 for i in range(len(track_points) - 1):
                     p1 = track_points[i]
                     p2 = track_points[i+1]
-                    
                     coord1 = (p1.latitude, p1.longitude)
                     coord2 = (p2.latitude, p2.longitude)
                     
-                    if i == 0:
-                        day_bucket['full_coords'].append(coord1)
+                    if i == 0: day_bucket['full_coords'].append(coord1)
                     day_bucket['full_coords'].append(coord2)
                     
                     dist = p1.distance_2d(p2)
                     day_bucket['distance_m'] += dist
                     
                     speed = calculate_speed(p1, p2)
-                    if speed >= 160: 
-                        speed = day_bucket['max_speed']
-                    
-                    if speed > day_bucket['max_speed']:
-                        day_bucket['max_speed'] = speed
+                    if speed >= 160: speed = day_bucket['max_speed']
+                    if speed > day_bucket['max_speed']: day_bucket['max_speed'] = speed
                         
                     speed_bucket = round(speed / 12.0) * 12
                     
@@ -119,7 +211,6 @@ def process_gpx_to_chunked_days(folder_path):
                     else:
                         avg_chunk_speed = sum(speeds_in_chunk) / len(speeds_in_chunk)
                         day_bucket['chunks'].append((current_chunk_coords, avg_chunk_speed))
-                        
                         current_speed_bucket = speed_bucket
                         current_chunk_coords = [coord1, coord2]
                         speeds_in_chunk = [speed]
@@ -130,13 +221,9 @@ def process_gpx_to_chunked_days(folder_path):
                 
     return daily_data
 
-def build_production_site(daily_data, output_html="index.html"):
-    """Generates an optimized web map with support for rendering timeless tracks."""
-    if not daily_data:
-        print("No valid tracking records extracted. Aborting.")
-        return
-
-    sorted_dates = sorted(daily_data.keys())
+def build_production_site(daily_data, photo_data, output_html="index.html"):
+    """Generates an optimized web map featuring interactive card containers and split-performance photos."""
+    sorted_dates = sorted(daily_data.keys()) if daily_data else []
     all_coords = []
     global_max_speed = 0.0
     grand_total_distance_km = 0.0
@@ -150,11 +237,12 @@ def build_production_site(daily_data, output_html="index.html"):
         if day['max_speed'] > global_max_speed:
             global_max_speed = day['max_speed']
 
-    max_display_speed = max(int(math.ceil(global_max_speed / 10.0) * 10), 20)
+    for photo in photo_data:
+        all_coords.append((photo["lat"], photo["lon"]))
 
+    max_display_speed = max(int(math.ceil(global_max_speed / 10.0) * 10), 20)
     mymap = folium.Map(tiles=None, prefer_canvas=True)
     
-    # Base Map configurations
     folium.TileLayer("Cartodb Positron", name="☀️ Light Theme", control=True, show=True).add_to(mymap)
     folium.TileLayer("Cartodb dark_matter", name="🌙 Dark Theme", control=True, show=False).add_to(mymap)
     folium.TileLayer(
@@ -164,9 +252,8 @@ def build_production_site(daily_data, output_html="index.html"):
     folium.TileLayer("OpenStreetMap", name="🗺️ Street View", control=True, show=False).add_to(mymap)
 
     colormap = cm.LinearColormap(
-        colors=['#2ecc71', '#f1c40f', '#e74c3c'],
-        vmin=0, vmax=max_display_speed,
-        caption="Speed Profile (km/h)"
+        colors=['#2ecc71', '#f1c40f', '#e74c3c'], vmin=0, vmax=max_display_speed,
+        caption="Driving Velocity Profile (km/h)"
     )
     colormap.add_to(mymap)
 
@@ -176,7 +263,6 @@ def build_production_site(daily_data, output_html="index.html"):
         formatted_date = date.strftime('%b %d, %Y')
         day_dist_km = day['distance_m'] / 1000.0
         
-        # Safe metric parsing string definitions block
         if day['total_seconds'] > 0:
             day_avg_speed = (day_dist_km / (day['total_seconds'] / 3600.0))
             avg_speed_str = f"{day_avg_speed:.1f} km/h"
@@ -224,9 +310,28 @@ def build_production_site(daily_data, output_html="index.html"):
 
         day_feature_group.add_to(mymap)
 
+    if photo_data:
+        photo_feature_group = folium.FeatureGroup(name="📸 Travel Snapshots", overlay=True, control=True)
+        for idx, photo in enumerate(photo_data):
+            icon_html = f"""
+                <img src='{photo["thumb_url"]}' class='map-photo-marker' onclick='launchLightboxGallery({idx})' loading='lazy' />
+            """
+            custom_icon = folium.DivIcon(html=icon_html, icon_size=(44, 44), icon_anchor=(22, 22))
+            
+            tooltip_html = f"""
+                <div style="font-family: 'Segoe UI', sans-serif; font-size: 12px; padding: 2px; color: #1e293b; white-space: nowrap;">
+                    <span style="font-weight: 500; color: #1e293b;">{photo["formatted_time"]}</span>
+                </div>
+            """
+            folium.Marker(
+                location=[photo["lat"], photo["lon"]], icon=custom_icon,
+                tooltip=folium.Tooltip(tooltip_html, sticky=True)
+            ).add_to(photo_feature_group)
+        photo_feature_group.add_to(mymap)
+
     folium.LayerControl(collapsed=False).add_to(mymap)
 
-    # UI Glassmorphism Layout Stylesheet
+    # UI Comprehensive Layout Stylesheet Override
     ui_css_override = """
     <style>
         .leaflet-control-layers {
@@ -284,14 +389,131 @@ def build_production_site(daily_data, output_html="index.html"):
         .leaflet-control-layers-selector[type="radio"] { appearance: none; -webkit-appearance: none; width: 18px; height: 18px; border: 2px solid #cbd5e1; border-radius: 50%; margin-right: 12px !important; position: relative; background: #ffffff; flex-shrink: 0; cursor: pointer; transition: all 0.2s ease; }
         .leaflet-control-layers-selector[type="radio"]:checked { border-color: #3b82f6; }
         .leaflet-control-layers-selector[type="radio"]:checked::after { content: ''; position: absolute; width: 8px; height: 8px; background-color: #3b82f6; border-radius: 50%; top: 3px; left: 3px; }
+
+        .map-photo-marker {
+            width: 44px; height: 44px;
+            border: 3px solid #ffffff; border-radius: 10px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+            object-fit: cover; cursor: pointer;
+            transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.2s;
+        }
+        .map-photo-marker:hover {
+            transform: scale(1.25); border-color: #3b82f6; z-index: 999999 !important;
+        }
+
+        .leaflet-marker-icon, 
+        .leaflet-marker-icon:focus,
+        .leaflet-interactive:focus,
+        .map-photo-marker,
+        .map-photo-marker:focus {
+            outline: none !important;
+            box-shadow: none !important;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        #global-photo-lightbox {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+            background-color: rgba(15, 23, 42, 0.95); 
+            z-index: 9999999; display: none; align-items: center; justify-content: center;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+        #lightbox-image-frame {
+            max-width: 85%; max-height: 80%;
+            border-radius: 8px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            object-fit: contain; user-select: none; -webkit-user-drag: none;
+        }
+        .lightbox-control-btn {
+            position: absolute; color: #f8fafc; font-size: 28px; font-weight: 300;
+            width: 56px; height: 56px; line-height: 52px; background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.1); border-radius: 50%; text-align: center;
+            cursor: pointer; user-select: none; transition: background 0.15s, transform 0.1s;
+        }
+        .lightbox-control-btn:hover { background: rgba(255,255,255,0.15); }
+        .lightbox-control-btn:active { transform: scale(0.95); }
+        #lightbox-left-arrow { left: 40px; }
+        #lightbox-right-arrow { right: 40px; }
+        #lightbox-close-btn { top: 30px; right: 40px; font-size: 22px; }
+        
+        #lightbox-meta-tag {
+            position: absolute; bottom: 40px; color: #e2e8f0; font-size: 14px;
+            background: rgba(0,0,0,0.4); padding: 8px 20px; border-radius: 20px;
+            backdrop-filter: blur(4px); pointer-events: none; text-align: center;
+        }
     </style>
     """
     mymap.get_root().header.add_child(folium.Element(ui_css_override))
-    mymap.get_root().header.add_child(folium.Element("<title>Trip Journal</title>"))
+    mymap.get_root().header.add_child(folium.Element("<title>Road Trip Journal</title>"))
 
-    # JavaScript integration controller 
+    # JavaScript controller injection block
     ui_javascript_injector = f"""
+    <div id="global-photo-lightbox">
+        <span class="lightbox-control-btn" id="lightbox-close-btn" onclick="closeLightboxGallery()">✕</span>
+        <span class="lightbox-control-btn" id="lightbox-left-arrow" onclick="navigateLightbox(-1)">‹</span>
+        <span class="lightbox-control-btn" id="lightbox-right-arrow" onclick="navigateLightbox(1)">›</span>
+        <img id="lightbox-image-frame" src="" />
+        <div id="lightbox-meta-tag"></div>
+    </div>
+
     <script>
+    const dynamicPhotoArray = {str([{k: v for k, v in p.items() if k != 'datetime'} for p in photo_data])};
+    let currentLightboxIndex = 0;
+
+    function launchLightboxGallery(index) {{
+        currentLightboxIndex = index;
+        updateLightboxDisplay();
+        document.getElementById('global-photo-lightbox').style.display = 'flex';
+    }}
+
+    function closeLightboxGallery() {{
+        document.getElementById('global-photo-lightbox').style.display = 'none';
+    }}
+
+    function navigateLightbox(direction) {{
+        currentLightboxIndex += direction;
+        if (currentLightboxIndex >= dynamicPhotoArray.length) currentLightboxIndex = 0;
+        if (currentLightboxIndex < 0) currentLightboxIndex = dynamicPhotoArray.length - 1;
+        updateLightboxDisplay();
+    }}
+
+    function updateLightboxDisplay() {{
+        if(dynamicPhotoArray.length === 0) return;
+        const currentTarget = dynamicPhotoArray[currentLightboxIndex];
+        document.getElementById('lightbox-image-frame').src = currentTarget.full_url;
+        document.getElementById('lightbox-meta-tag').innerHTML = `<b>${{currentTarget.filename}}</b><br>${{currentTarget.formatted_time}}`;
+    }}
+
+    document.addEventListener('keydown', function(event) {{
+        const lightboxView = document.getElementById('global-photo-lightbox');
+        if (lightboxView.style.display === 'flex') {{
+            if (event.key === 'ArrowRight') navigateLightbox(1);
+            if (event.key === 'ArrowLeft') navigateLightbox(-1);
+            if (event.key === 'Escape') closeLightboxGallery();
+        }}
+    }});
+
+    let touchStartAxisX = 0;
+    let touchEndAxisX = 0;
+    const lightboxFrame = document.getElementById('global-photo-lightbox');
+    
+    lightboxFrame.addEventListener('touchstart', e => {{
+        touchStartAxisX = e.changedTouches[0].screenX;
+    }}, {{passive: true}});
+
+    lightboxFrame.addEventListener('touchend', e => {{
+        touchEndAxisX = e.changedTouches[0].screenX;
+        handleSwipeGesture();
+    }}, {{passive: true}});
+
+    function handleSwipeGesture() {{
+        const deltaThreshold = 50;
+        if (touchStartAxisX - touchEndAxisX > deltaThreshold) {{
+            navigateLightbox(1);
+        }}
+        if (touchEndAxisX - touchStartAxisX > deltaThreshold) {{
+            navigateLightbox(-1);
+        }}
+    }}
+
     function compileUnifiedLeftDashboard() {{
         var masterPanel = document.querySelector('.leaflet-control-layers');
         var stylePanel = document.querySelector('.leaflet-control-layers-base');
@@ -306,7 +528,7 @@ def build_production_site(daily_data, output_html="index.html"):
                 </h4>
                 <table style="width:100%; border-collapse:collapse; line-height:1.7; font-size:13px; margin-bottom: 12px;">
                     <tr><td style="color:#64748b;"><b>Total Timeline:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{len(sorted_dates)} Days</td></tr>
-                    <tr><td style="color:#64748b;"><b>Total Time:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{format_duration(grand_total_seconds)}</td></tr>
+                    <tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">{format_duration(grand_total_seconds)}</td></tr>
                     <tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">{grand_total_distance_km:.1f} km</td></tr>
                 </table>
             `;
@@ -393,7 +615,6 @@ def build_production_site(daily_data, output_html="index.html"):
     """
     mymap.get_root().html.add_child(folium.Element(ui_javascript_injector))
 
-    # Top Center Header Title Banner
     title_html = """
     <div style="position: fixed; 
                 top: 25px; left: 50%; transform: translateX(-50%); width: auto; max-width: 85%;
@@ -403,24 +624,27 @@ def build_production_site(daily_data, output_html="index.html"):
                 border: 1px solid #e2e8f0; backdrop-filter: blur(8px);
                 text-align: center; white-space: nowrap;">
         <h1 style="margin: 0; color: #1e293b; font-size: 18px; font-weight: 700; letter-spacing: -0.5px;">
-            🚗 Our Adventure
+            🚗 Our Road Trip Adventure
         </h1>
     </div>
     """
     mymap.get_root().html.add_child(folium.Element(title_html))
 
-    min_lat, max_lat = min(c[0] for c in all_coords), max(c[0] for c in all_coords)
-    min_lon, max_lon = min(c[1] for c in all_coords), max(c[1] for c in all_coords)
-    mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
+    if all_coords:
+        min_lat, max_lat = min(c[0] for c in all_coords), max(c[0] for c in all_coords)
+        min_lon, max_lon = min(c[1] for c in all_coords), max(c[1] for c in all_coords)
+        mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Interactive map exported successfully to: '{output_html}'")
+    print(f"🎉 Success! Web map tracking interface cleanly built at: '{output_html}'")
 
 if __name__ == "__main__":
-    # --- FIXED: ABSOLUTE RELATIVE SCRIPT ANCHORING ---
-    # Finds the folder containing this python file, then targets "GPXLogs" right next to it.
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
     TARGET_GPX_FOLDER = os.path.join(SCRIPT_DIRECTORY, "GPXLogs")
+    TARGET_IMAGE_FOLDER = os.path.join(SCRIPT_DIRECTORY, "images")
+    TARGET_THUMB_FOLDER = os.path.join(SCRIPT_DIRECTORY, "thumbnails")
     
     data_matrix = process_gpx_to_chunked_days(TARGET_GPX_FOLDER)
-    build_production_site(data_matrix, output_html="index.html")
+    photo_matrix = process_images_folder(TARGET_IMAGE_FOLDER, TARGET_THUMB_FOLDER)
+    
+    build_production_site(data_matrix, photo_matrix, output_html="index.html")
