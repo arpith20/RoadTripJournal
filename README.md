@@ -36,7 +36,7 @@ Place your target tracking logs inside a designated directory. The script handle
 ```text
 TripJournal/
 │
-├── generate_heatmap.py       # Main production script
+├── generate_html.py       # Main production script
 ├── README.md                 # Project Documentation
 └── GPXLogs/                  # Directory containing input GPX logs
     ├── day1_morning.gpx
@@ -47,11 +47,11 @@ TripJournal/
 
 ### Execution
 
-1. Open `generate_heatmap.py`.
+1. Open `generate_html.py`.
 2. Scroll to the bottom execution block. The script is pre-configured to look for a folder named `GPXLogs` sitting in the exact same directory where the script is located, meaning you can execute it from anywhere.
 3. Run the script from your terminal:
    ```bash
-   python generate_heatmap.py
+   python generate_html.py
    ```
 4. Double-click the newly compiled `index.html` file to view your journey in any web browser.
 
