@@ -1,11 +1,13 @@
 import os
 import math
+import time
 from datetime import datetime
 from collections import defaultdict
 import gpxpy
 import folium
 import branca.colormap as cm
 from PIL import Image, ImageOps
+from geopy.geocoders import Nominatim
 
 def calculate_speed(p1, p2):
     """Calculates speed between two sequential points in km/h."""
@@ -84,7 +86,7 @@ def process_images_folder(image_folder, thumb_folder):
     
     os.makedirs(thumb_folder, exist_ok=True)
     
-    print("🧹 Step 1.2: Wiping thumbnail directory completely for a fresh rebuild...")
+    print("🧹 Wiping thumbnail directory completely for a fresh rebuild...")
     for filename in os.listdir(thumb_folder):
         file_path = os.path.join(thumb_folder, filename)
         try:
@@ -220,7 +222,7 @@ def process_gpx_to_chunked_days(folder_path):
     return daily_data
 
 def build_production_site(daily_data, photo_data, output_html="index.html"):
-    """Generates an optimized web map featuring an absolute spatial anchor for the first stacked image."""
+    """Generates an interactive web map with unified regional centroid pins and localized image fan-outs."""
     gpx_dates = set(daily_data.keys())
     photo_dates = {p["datetime"].date() for p in photo_data}
     master_sorted_dates = sorted(list(gpx_dates.union(photo_dates)))
@@ -238,15 +240,44 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         if day['max_speed'] > global_max_speed:
             global_max_speed = day['max_speed']
 
-    print("🛠️  Step 1.8: Pre-processing photos to fan-out grouped stacks around their true anchor...")
+    print("🛠️  Step 1.8: Pre-processing photos to analyze structural region layouts...")
     photos_by_date = defaultdict(list)
     for p_idx, p_data in enumerate(photo_data):
         photos_by_date[p_data["datetime"].date()].append(p_idx)
 
-    radius_offset_degrees = 0.00012 # Tight, clean separation radius (~12-14 meters)
+    geolocator = Nominatim(user_agent="road_trip_journal_engine")
+    processed_regional_keys = {}
+    city_centroid_accumulator = defaultdict(list)
+    
+    radius_offset_degrees = 0.00012 
 
     for date, indices in photos_by_date.items():
-        if len(indices) < 2: continue
+        if not indices: continue
+        
+        # --- UPDATE PART A: COLLECT UNIQUE REGIONS BASED ON RAW TRUE UNROUNDED TELEMETRY ---
+        for idx in indices:
+            lat = photo_data[idx]['lat']
+            lon = photo_data[idx]['lon']
+            regional_key = (round(lat, 2), round(lon, 2))
+            
+            if regional_key not in processed_regional_keys:
+                try:
+                    time.sleep(0.5)  # Respect open OSM access policy bounds
+                    location_data = geolocator.reverse((lat, lon), timeout=4, language='en')
+                    city_name = None
+                    if location_data and 'address' in location_data.raw:
+                        address = location_data.raw['address']
+                        city_name = address.get('city') or address.get('town') or address.get('village') or address.get('county') or address.get('state_district')
+                    processed_regional_keys[regional_key] = city_name
+                except Exception:
+                    processed_regional_keys[regional_key] = None
+            
+            resolved_city = processed_regional_keys[regional_key]
+            if resolved_city:
+                # Accumulate the raw unshifted coordinates to find the true geometric center later
+                city_centroid_accumulator[(date, resolved_city)].append((lat, lon))
+
+        # Perform local stack alignment separation (micro fan-out loop)
         spacial_stacks = defaultdict(list)
         for idx in indices:
             rounded_lat = round(photo_data[idx]['lat'], 5)
@@ -256,25 +287,31 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         for base_coords, stack_indices in spacial_stacks.items():
             stack_size = len(stack_indices)
             if stack_size > 1:
-                # --- UPDATE: LOCK DOWN THE TRUE UNROUNDED ANCHOR ---
-                # We extract the absolute unrounded coordinates of the first image
                 anchor_idx = stack_indices[0]
                 base_lat = photo_data[anchor_idx]['lat']
                 base_lon = photo_data[anchor_idx]['lon']
-                
                 lon_correction = 1.0 / math.cos(math.radians(base_lat)) if -90 < base_lat < 90 else 1.0
 
                 for group_idx, target_photo_idx in enumerate(stack_indices):
-                    # Image 0 stays strictly on the original unrounded spot
                     if group_idx == 0: continue
-                    
-                    # Beautifully distribute the rest around the true anchor image
                     angle = (2 * math.pi * (group_idx - 1)) / (stack_size - 1)
                     offset_lat = radius_offset_degrees * math.sin(angle)
                     offset_lon = radius_offset_degrees * math.cos(angle) * lon_correction
-                    
                     photo_data[target_photo_idx]['lat'] = base_lat + offset_lat
                     photo_data[target_photo_idx]['lon'] = base_lon + offset_lon
+
+    # --- UPDATE PART B: COMPUTE THE MATHEMATICAL CENTROID MATRIX ---
+    discovered_cities_by_date = defaultdict(list)
+    for (date, city_name), coord_list in city_centroid_accumulator.items():
+        if not coord_list: continue
+        avg_lat = sum(c[0] for c in coord_list) / len(coord_list)
+        avg_lon = sum(c[1] for c in coord_list) / len(coord_list)
+        discovered_cities_by_date[date].append({
+            "name": city_name,
+            "lat": avg_lat,
+            "lon": avg_lon
+        })
+        all_coords.append((avg_lat, avg_lon))
 
     for photo in photo_data:
         all_coords.append((photo["lat"], photo["lon"]))
@@ -361,10 +398,19 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                         <span style="font-weight: 500; color: #1e293b;">{photo["formatted_time"]}</span>
                     </div>
                 """
-                folium.Marker(
-                    location=[photo["lat"], photo["lon"]], icon=custom_icon,
-                    tooltip=folium.Tooltip(tooltip_html, sticky=True)
-                ).add_to(day_feature_group)
+                folium.Marker(location=[photo["lat"], photo["lon"]], icon=custom_icon, tooltip=folium.Tooltip(tooltip_html, sticky=True)).add_to(day_feature_group)
+
+        # --- UPDATE PART C: INJECT SINGLE APPROXIMATE CENTROID PIN FOR METROPOLITAN CLUSTERS ---
+        if date in discovered_cities_by_date:
+            for city_pin in discovered_cities_by_date[date]:
+                city_html = f"""
+                <div class="city-marker-wrapper city-pin-marker">
+                    <span class="city-marker-dot"></span>
+                    <span class="city-marker-label">{city_pin["name"]}</span>
+                </div>
+                """
+                city_icon = folium.DivIcon(html=city_html, icon_size=(200, 30), icon_anchor=(10, 10))
+                folium.Marker(location=[city_pin["lat"], city_pin["lon"]], icon=city_icon).add_to(day_feature_group)
 
         day_feature_group.add_to(mymap)
 
@@ -445,8 +491,13 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
             outline: none !important; box-shadow: none !important; -webkit-tap-highlight-color: transparent;
         }
 
+        .city-marker-wrapper { display: flex; align-items: center; white-space: nowrap; pointer-events: none; }
+        .city-marker-dot { width: 10px; height: 10px; background-color: #ef4444; border: 2px solid #ffffff; border-radius: 50%; box-shadow: 0 2px 8px rgba(0,0,0,0.3); display: inline-block; }
+        .city-marker-label { font-family: 'Segoe UI', system-ui, sans-serif; font-size: 11px; font-weight: 700; color: #0f172a; background-color: rgba(255, 255, 255, 0.92); border: 1px solid #e2e8f0; padding: 3px 8px; border-radius: 6px; box-shadow: 0 4px 12px rgba(15,23,42,0.06); margin-left: 6px; backdrop-filter: blur(4px); }
+
         body.hide-photos-global .map-photo-marker { display: none !important; pointer-events: none !important; }
         body.hide-gpx-global .leaflet-overlay-pane canvas { display: none !important; pointer-events: none !important; }
+        body.hide-pins-global .city-pin-marker { display: none !important; pointer-events: none !important; }
 
         #global-photo-lightbox {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: rgba(15, 23, 42, 0.95); 
@@ -560,12 +611,15 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                     <tr><td style="color:#64748b;"><b>Total Driving:</b></td><td style="text-align:right; font-weight:bold; color:#1e293b;">__TOTAL_DURATION__</td></tr>
                     <tr style="font-size: 14px; border-top: 1px solid #edf2f7;"><td style="color:#64748b; padding-top:6px;"><b>Grand Total:</b></td><td style="text-align:right; font-weight:bold; color:#3b82f6; padding-top:6px;">__TOTAL_DISTANCE__ km</td></tr>
                 </table>
-                <div style="display: flex; gap: 16px; justify-content: flex-start; margin-top: 10px; padding-top: 10px; border-top: 1px solid #edf2f7; margin-bottom: 4px;">
-                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; font-weight: 600; color: #475569; user-select: none;">
-                        <input type="checkbox" id="global-filter-gpx" checked style="cursor: pointer; width: 14px; height: 14px;"> 🚗 Show Tracks
+                <div style="display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-start; margin-top: 10px; padding-top: 10px; border-top: 1px solid #edf2f7; margin-bottom: 4px;">
+                    <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">
+                        <input type="checkbox" id="global-filter-gpx" checked style="cursor: pointer; width: 13px; height: 13px;"> 🚗 Tracks
                     </label>
-                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; font-weight: 600; color: #475569; user-select: none;">
-                        <input type="checkbox" id="global-filter-photos" checked style="cursor: pointer; width: 14px; height: 14px;"> 📸 Show Photos
+                    <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">
+                        <input type="checkbox" id="global-filter-photos" checked style="cursor: pointer; width: 13px; height: 13px;"> 📸 Photos
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px; font-weight: 600; color: #475569; user-select: none;">
+                        <input type="checkbox" id="global-filter-pins" checked style="cursor: pointer; width: 13px; height: 13px;"> 📍 Pins
                     </label>
                 </div>
             `;
@@ -622,6 +676,14 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
                         document.body.classList.remove('hide-photos-global');
                     } else {
                         document.body.classList.add('hide-photos-global');
+                    }
+                });
+
+                document.getElementById('global-filter-pins').addEventListener('change', function(e) {
+                    if (e.target.checked) {
+                        document.body.classList.remove('hide-pins-global');
+                    } else {
+                        document.body.classList.add('hide-pins-global');
                     }
                 });
 
@@ -696,7 +758,7 @@ def build_production_site(daily_data, photo_data, output_html="index.html"):
         mymap.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
 
     mymap.save(output_html)
-    print(f"🎉 Success! Completely path-proof rendering setup written to: '{output_html}'")
+    print(f"🎉 Success! Beautiful spatial-centroid layout compiled smoothly to: '{output_html}'")
 
 if __name__ == "__main__":
     SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))

@@ -26,7 +26,7 @@ Engineered with a sleek, modern glassmorphic sidebar dashboard, it consolidates 
 Ensure you have Python 3.10+ installed along with the required parsing and visualization libraries:
 
 ```bash
-pip install gpxpy folium branca pillow
+pip install gpxpy folium branca pillow geopy
 ```
 
 ### File Architecture
